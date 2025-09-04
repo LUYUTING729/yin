@@ -1,0 +1,160 @@
+## config.yaml
+
+## Instance generation parameters (from paper Section 5.1)
+instance_generation:
+  n_values: [10, 20, 30, 35, 40, 45]   ## number of customers used in experiments
+  theta_values: [0.1, 0.3, 0.5, 0.7, 0.9]   ## fraction of customers drone-eligible
+  instance_types: 3                         ## three instance types described in paper
+  replicates_per_setting: 3                 ## three replications per (type, n, theta)
+  coord_grid:
+    start: 0.0
+    end: 15.0
+    step: 0.5                              ## coordinates sampled from {0,0.5,...,15} for types 1 & 2
+  cluster_generation:
+    gamma_distribution:
+      type: normal
+      mu: 0.0
+      sigma: 10.0                          ## paper: gamma ~ N(0, 10^2)
+    phi_distribution:
+      type: uniform
+      low: 0.0
+      high: 6.283185307179586              ## 2*pi
+  depot_type:
+    type1: random_on_grid                  ## depot randomly chosen on same grid (type 1)
+    type2: mean_of_customers               ## depot at mean of customer coords (type 2)
+    type3: origin                          ## depot at origin for clustered instances (type 3)
+  demand_sampling:
+    values: [10, 20, 30, 40, 50]           ## per paper
+  time_window_generation:
+    depot_time_window: [0, 480]            ## L_t = 480 minutes (paper)
+    half_width_distribution:
+      type: normal
+      mu: 30.0
+      sigma: 10.0                          ## paper: half width ~ N(30, 10^2)
+    solomon_center_method: true            ## paper: use Solomon method to generate centers (implementation detail)
+  seeds:
+    base_seed: 123456                      ## reproducibility; change as needed
+
+## Problem and vehicle parameters (from paper)
+problem_parameters:
+  Q_t: 100                                ## truck capacity (paper)
+  Q_d: 20                                 ## drone capacity (paper)
+  L_t: 480                                ## maximum truck route duration (minutes) (paper)
+  L_d: 30                                 ## maximum drone flight time (minutes) (paper)
+  v_t_kmph: 40.0                          ## truck speed (km/h) (paper)
+  v_d_kmph: 40.0                          ## drone speed (km/h) (paper) -> paper states alpha=1
+  beta: 2.0                               ## d_t = beta * d_d (paper sets beta = 2)
+  demand_values: [10, 20, 30, 40, 50]     ## repeated for clarity
+
+## Cost parameters (from paper)
+cost_parameters:
+  fixed_vehicle_cost_F: 20.0              ## dollars per dispatched truck-drone (paper)
+  truck_cost_per_min_c_t: 0.083           ## $ per minute (paper)
+  drone_cost_per_min_c_d: 0.021           ## $ per minute (paper)
+
+## Time-window & service-time details
+## Note: The paper states travel times include service time but does not specify numeric service times.
+## DO NOT INVENT values here; the implementation should set service times explicitly or expose config.
+service_times:
+  truck_service_time_minutes: null        ## NOT SPECIFIED IN PAPER - set before running experiments
+  drone_service_time_minutes: null        ## NOT SPECIFIED IN PAPER - set before running experiments
+
+## Solver configuration
+solver:
+  primary: CPLEX                          ## paper used CPLEX 12.8
+  backup: GUROBI                          ## optional fallback
+  cplex_api: docplex
+  lp_tolerance: 1e-6
+  integrality_tolerance: 1e-6
+
+## Time limits used in experiments (from paper)
+time_limits:
+  cg_root_enhancement_test_seconds: 1800  ## CG root-only experiment (Section 5.2.1)
+  sr_effectiveness_test_seconds: 7200     ## SR effectiveness runs (Section 5.2.2)
+  performance_small_seconds: 7200         ## for n <= 35 (Section 5.3)
+  performance_large_seconds: 10800        ## for n in {40,45} (Section 5.3)
+  per_pricing_call_seconds: null          ## NOT SPECIFIED IN PAPER; configurable by user
+
+## Column generation and cuts
+column_generation:
+  use_subset_row_inequalities: true       ## paper uses SR inequalities to tighten LB
+  sr_cardinality: 3                       ## |S| = 3 (paper)
+  sr_p: 2                                 ## p = 2 (paper)
+  sr_enumeration: true                    ## paper: complete enumeration for |S| = 3
+  sr_violation_eps: 1e-8
+  sr_max_add_per_iteration: null          ## NOT SPECIFIED IN PAPER; configurable
+  add_all_violated_sr_when_found: true    ## default behaviour (can be tuned)
+
+## Pricing subproblem algorithms (paper describes sequence)
+pricing:
+  sequence:
+    - greedy_deterministic
+    - greedy_randomized
+    - tabu_search
+    - dynamic_ng_route
+    - bounded_bidirectional_labeling
+  heuristic_params:                         ## many heuristic hyperparameters are NOT specified in paper
+    greedy_random_restarts: null            ## NOT SPECIFIED IN PAPER; configure before experiments
+    greedy_random_top_k: null               ## NOT SPECIFIED IN PAPER
+    tabu_tenure: null                       ## NOT SPECIFIED IN PAPER
+    tabu_max_iterations: null               ## NOT SPECIFIED IN PAPER
+    ng_initial_neighborhood_size: null      ## NOT SPECIFIED IN PAPER
+    ng_max_augment_rounds: null             ## NOT SPECIFIED IN PAPER
+    labeler_time_limit_seconds: null        ## NOT SPECIFIED IN PAPER - recommended to set by user
+
+## Branching settings (three-stage hierarchical branching described in paper)
+branching:
+  strategy: hierarchical_3_stage
+  stage1: vehicle_count
+  stage2: outflow_set_size: 2
+  stage3: individual_arc
+  node_selection: best_bound                  ## choose node with lowest LB
+  prune_if_lb_ge_incumbent: true
+
+## Experiment definitions (matching paper)
+experiments:
+  enhancement_strategies_test:
+    instances: {n: 35, thetas: [0.1, 0.3, 0.5, 0.7, 0.9]}
+    time_limit_seconds: 1800
+    metrics: [No_Uns, Ave_Time, Ave_Col, Ave_Cut, Ave_rGap, N0, N1, N2, N3]
+  sr_inequalities_test:
+    instances: {n: 35, thetas: [0.1, 0.3, 0.5, 0.7, 0.9]}
+    time_limit_seconds: 7200
+    metrics: [No_Uns, Ave_Time, Ave_Gap, Ave_Node, Ave_rCost]
+  performance_comparison:
+    instances: all  ## all generated instances
+    time_limits:
+      small_instances_seconds: 7200
+      large_instances_seconds: 10800
+    metrics: [No_Uns, Ave_Time, Ave_Gap, Ave_Node, AM_Time, AS_Time]
+  sensitivity_analysis:
+    base_instance: {n: 35, theta: 0.5}
+    varying:
+      - L_d: [10, 20, 30, 40, 50]
+      - Q_d: [10, 20, 30, 40, 50]
+      - beta: [1.5, 2.0, 2.5]
+      - time_window_multiplier_delta: [-0.2, 0.0, 0.2]
+
+## Output, logging, and reproducibility
+output:
+  instances_dir: "instances/"
+  results_dir: "results/"
+  logs_dir: "logs/"
+  save_columns: true
+  save_rlmp_snapshots: true
+
+logging:
+  level: INFO
+  structured_json: true
+  cg_iteration_log: true
+  per_node_log: true
+
+reproducibility:
+  global_random_seed: 123456
+  deterministic_hashing: true
+
+## Notes and TODO (explicitly not fabricating missing values)
+## - Several heuristic hyperparameters and service times are NOT specified in the paper.
+##   These fields are intentionally left null; set them before running experiments.
+## - The YAML contains only values explicitly provided in the paper; other fields are placeholders
+##   and must be configured by implementer prior to execution.

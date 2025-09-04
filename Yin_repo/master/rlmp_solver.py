@@ -1,0 +1,825 @@
+## master/rlmp_solver.py
+
+"""
+RLMP_Solver: Restricted Master Problem solver for the Branch-and-Price-and-Cut (BPC)
+framework for the TD-DRPTW problem.
+
+This module implements the RLMP_Solver class described in the reproducibility plan
+and design. It uses docplex (CPLEX) as the LP/MIP solver backend and interacts with
+the ColumnPool to synchronize columns (synthetic-routes) into the master model.
+
+Primary responsibilities:
+- Maintain an LP model of the current restricted master (columns in ColumnPool).
+- Support adding SR cuts and a vehicle-count branching constraint.
+- Provide solve_lp() returning primal lambdas and duals suitable for pricing.
+- Provide solve_ip() to attempt to find an integer solution over current columns.
+- Seed initial columns when necessary (uses simple truck-only single-customer routes).
+- Sync model with ColumnPool (rebuild-on-sync fallback implementation for robustness).
+
+Notes:
+- This implementation rebuilds the model from scratch in sync_model_with_column_pool()
+  for correctness and simplicity. This is robust (no incremental-update bugs) and
+  acceptable for reproducibility. If performance is required, incremental updates
+  could be implemented later.
+- The code requires docplex (and a working CPLEX installation) as listed in
+  requirements. If docplex is unavailable, the constructor raises ImportError.
+
+Author: Reproducibility implementation
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+# docplex imports (required)
+try:
+    from docplex.mp.model import Model
+    from docplex.mp.constants import TimeLimitException
+except Exception as ex:  # pragma: no cover - environment dependent
+    raise ImportError(
+        "docplex is required for RLMP_Solver. Install 'docplex' and ensure CPLEX is available. "
+        "Original import error: {}".format(ex)
+    )
+
+# Project imports (relative)
+from instances.instance import Instance
+from columns.column_pool import ColumnPool
+from routes.route import Column, Route
+from geometry.distances import DistanceMatrix
+
+# Optional logger utility if present in project
+try:
+    from utils.logger import Logger  # type: ignore
+except Exception:
+    Logger = None  # type: ignore
+
+
+# Type aliases
+Node = int
+Arc = Tuple[int, int]
+SRCut = Tuple[Tuple[int, ...], int]  # (S_tuple, p)
+
+
+class RLMPException(Exception):
+    """Generic RLMP Solver exception."""
+    pass
+
+
+class RLMP_Solver:
+    """
+    RLMP_Solver implements the restricted master problem (set-partitioning / column LP)
+    and related utilities.
+
+    Constructor:
+        RLMP_Solver(instance: Instance,
+                    column_pool: ColumnPool,
+                    config: Optional[Dict[str, Any]] = None,
+                    logger: Optional[Logger] = None)
+
+    Public methods:
+      - seed_initial_columns()
+      - sync_model_with_column_pool()
+      - add_columns(columns: Iterable[Column])
+      - add_sr_cuts(cuts: List[SRCut])
+      - solve_lp() -> (obj_value: float, primal_lambda: Dict[str,float], duals: Dict[str,Any])
+      - solve_ip(time_limit: Optional[float]) -> (obj_value: Optional[float], integer_solution: Optional[Dict[str,int]])
+      - add_vehicle_count_constraint(lb: Optional[int], ub: Optional[int]) -> None
+      - remove_vehicle_count_constraint() -> None
+    """
+
+    def __init__(
+        self,
+        instance: Instance,
+        column_pool: ColumnPool,
+        config: Optional[Dict[str, Any]] = None,
+        logger: Optional[Any] = None,
+    ) -> None:
+        # Validate inputs
+        if instance is None or column_pool is None:
+            raise ValueError("RLMP_Solver requires non-null 'instance' and 'column_pool' arguments.")
+        if not isinstance(instance, Instance):
+            raise TypeError("instance must be an Instance object.")
+        if not isinstance(column_pool, ColumnPool):
+            raise TypeError("column_pool must be a ColumnPool object.")
+
+        self.instance: Instance = instance
+        self.column_pool: ColumnPool = column_pool
+        self.config: Dict[str, Any] = dict(config or {})
+        self.logger = logger
+
+        # solver/model placeholders
+        self.model: Optional[Model] = None
+        # Mappings
+        self.lambda_vars: Dict[str, Any] = {}  # column_id -> docplex variable
+        self.customer_constraints: Dict[int, Any] = {}  # customer i -> constraint handle
+        self.sr_cuts: List[Dict[str, Any]] = []  # list of {'id': sr_id, 'S': tuple, 'p': int, 'constraint': handle}
+        self.vehicle_count_constraint: Optional[Any] = None  # solver constraint handle (if present)
+        # mapping of column ids currently known (keeps in-sync)
+        self._known_column_ids: Set[str] = set()
+
+        # configuration-derived fields and defaults
+        cg_cfg = self.config.get("column_generation", {}) or {}
+        problem_params = self.config.get("problem_parameters", {}) or {}
+        cost_params = self.config.get("cost_parameters", {}) or {}
+
+        # cost F if present, else try to fallback to instance.params snapshot
+        self.F: float = float(cost_params.get("fixed_vehicle_cost_F", instance.params.get("cost_parameters", {}) .get("fixed_vehicle_cost_F", 20.0)))
+
+        # solver options
+        solver_cfg = self.config.get("solver", {}) or {}
+        self.lp_tolerance: float = float(solver_cfg.get("lp_tolerance", 1e-6))
+        self.integrality_tolerance: float = float(solver_cfg.get("integrality_tolerance", 1e-6))
+        self.solver_name: str = str(solver_cfg.get("primary", "CPLEX"))
+
+        # SR defaults
+        self.sr_cardinality: int = int(cg_cfg.get("sr_cardinality", 3))
+        self.sr_p: int = int(cg_cfg.get("sr_p", 2))
+        self.sr_violation_eps: float = float(cg_cfg.get("sr_violation_eps", 1e-8))
+        # sr_max_add_per_iteration nullable
+        self.sr_max_add_per_iteration: Optional[int] = cg_cfg.get("sr_max_add_per_iteration", None)
+        if self.sr_max_add_per_iteration is not None:
+            try:
+                self.sr_max_add_per_iteration = int(self.sr_max_add_per_iteration)
+            except Exception:
+                self.sr_max_add_per_iteration = None
+
+        # initialize a simple logger if none provided and utils.logger available
+        if self.logger is None and Logger is not None:
+            try:
+                self.logger = Logger(run_id="RLMP", instance_id=getattr(self.instance, "id", None), config=self.config)
+            except Exception:
+                self.logger = None
+
+        # notes: we will rebuild model on sync; keep a small status object
+        self._last_solve_info: Dict[str, Any] = {}
+
+    # -------------------------
+    # Logging helper
+    # -------------------------
+    def _log(self, event: str, payload: Dict[str, Any]) -> None:
+        if self.logger is not None:
+            try:
+                self.logger.log(event, payload)
+            except Exception:
+                # avoid logger failures affecting solver
+                pass
+
+    # -------------------------
+    # Model building helpers
+    # -------------------------
+    def _build_model_from_columns(self) -> None:
+        """
+        Build (or rebuild) the docplex LP model from the current ColumnPool and
+        the stored SR cuts and vehicle-count constraint.
+
+        This function reconstructs:
+          - continuous variables lambda_r >= 0 for each column r in ColumnPool
+          - customer cover equality constraints sum_r a_ir * lambda_r == 1 for each customer
+          - SR cut inequalities stored in self.sr_cuts
+          - vehicle-count constraint if present (self.vehicle_count_constraint stored as dict {'lb':..., 'ub':...})
+
+        For robustness we rebuild model from scratch each time (simple and less error-prone).
+        """
+        start = time.time()
+        # Create model
+        m = Model(name="RLMP_restricted_master")
+        # Try to set deterministic solver options if available
+        # Note: not all environments expose deterministic controls; set common ones if available
+        try:
+            # set single thread for reproducibility (if supported)
+            m.parameters.threads = int(self.config.get("solver", {}).get("threads", 1))
+        except Exception:
+            pass
+
+        # Build customer cover constraints
+        customers = list(range(1, self.instance.n + 1))
+        # Initialize constraints with zero expression; we will add coefficients when adding variables
+        customer_cts: Dict[int, Any] = {}
+        for i in customers:
+            customer_cts[i] = m.add_constraint(m.expr_zero == 1.0, ctname=f"cover_cust_{i}")
+
+        # Build variables for each column in ColumnPool
+        lambda_vars: Dict[str, Any] = {}
+        columns = []
+        try:
+            columns = self.column_pool.get_all()
+        except Exception:
+            columns = []
+
+        # For each column, create variable and add coefficients to customer constraints
+        for col in columns:
+            # determine column id deterministically (prefer route_id)
+            col_id = getattr(col, "route_id", None)
+            if col_id is None:
+                # fallback to serialization fingerprint
+                try:
+                    ser = col.serialize() if hasattr(col, "serialize") else {}
+                    col_id = ser.get("route_id") or ser.get("meta", {}).get("route_id")
+                except Exception:
+                    col_id = f"col_{id(col)}"
+            col_id = str(col_id)
+
+            # objective coefficient = route cost (ensure finite)
+            try:
+                c_r = float(col.cost)
+            except Exception:
+                try:
+                    c_r = float(col.route.cost())
+                except Exception:
+                    c_r = float("inf")
+
+            # create continuous var lambda_r >= 0
+            var = m.continuous_var(lb=0.0, ub=None, name=f"lambda_{col_id}")
+            # set objective coefficient by building objective list later
+            lambda_vars[col_id] = {"var": var, "col_obj": float(c_r), "column": col}
+
+            # add coefficients to customer constraints based on a_ir
+            a_ir = {}
+            if hasattr(col, "a_ir") and isinstance(getattr(col, "a_ir"), dict):
+                a_ir = getattr(col, "a_ir")
+            else:
+                # try route.covers()
+                try:
+                    covered = col.route.covers()
+                    for i in covered:
+                        a_ir[int(i)] = 1
+                except Exception:
+                    a_ir = {}
+
+            for i, val in list(a_ir.items()):
+                try:
+                    coeff = float(val)
+                except Exception:
+                    try:
+                        coeff = float(int(val))
+                    except Exception:
+                        coeff = 0.0
+                if coeff == 0.0:
+                    continue
+                # Add var * coeff to constraint
+                try:
+                    customer_cts[int(i)].add(var * coeff)
+                except Exception:
+                    # If adding expression fails, do manual rebuild of constraint:
+                    # create a new linear expression: old_expr + coeff*var == 1
+                    # But docplex constraints don't expose easy replace; to keep simple, accumulate later
+                    pass
+
+        # Now finalize objective: sum of c_r * var
+        obj_terms = []
+        for cid, info in lambda_vars.items():
+            obj_terms.append(info["col_obj"] * info["var"])
+        if obj_terms:
+            m.minimize(m.sum(obj_terms))
+        else:
+            # No columns: create a zero objective (infeasible master will be detected by solve)
+            m.minimize(0.0)
+
+        # Recreate SR cuts if any
+        sr_handles = []
+        for sr in self.sr_cuts:
+            # sr is dict {'id':..., 'S': tuple, 'p': int}
+            S = tuple(sr["S"])
+            p = int(sr["p"])
+            # RHS floor(|S|/p)
+            rhs = math.floor(len(S) / p)
+            # Build LHS expression: sum_r (1/p * sum_{i in S} a_ir) * lambda_r
+            expr_terms = []
+            for cid, info in lambda_vars.items():
+                # determine coverage of cid for nodes in S
+                col = info["column"]
+                a_ir = {}
+                if hasattr(col, "a_ir") and isinstance(getattr(col, "a_ir"), dict):
+                    a_ir = getattr(col, "a_ir")
+                else:
+                    try:
+                        covered = col.route.covers()
+                        for i in covered:
+                            a_ir[int(i)] = 1
+                    except Exception:
+                        a_ir = {}
+                summ = 0.0
+                for i in S:
+                    summ += float(a_ir.get(i, 0.0))
+                coeff = (1.0 / float(p)) * summ
+                if coeff != 0.0:
+                    expr_terms.append(coeff * info["var"])
+            if expr_terms:
+                constr = m.add_constraint(m.sum(expr_terms) <= float(rhs), ctname=f"SR_{'_'.join(map(str, S))}_p{p}")
+            else:
+                constr = m.add_constraint(0.0 <= float(rhs), ctname=f"SR_empty_{'_'.join(map(str, S))}_p{p}")
+            sr_handles.append({"id": sr["id"], "S": S, "p": p, "constraint": constr})
+
+        # Vehicle-count constraint: if previously present, enforce same bounds
+        vc_handle = None
+        if self.vehicle_count_constraint is not None:
+            # self.vehicle_count_constraint stored as dict {'lb':..., 'ub':...}
+            lb = self.vehicle_count_constraint.get("lb", None)
+            ub = self.vehicle_count_constraint.get("ub", None)
+            # Build sum of all lambda vars
+            sum_vars = m.sum(info["var"] for info in lambda_vars.values()) if lambda_vars else 0.0
+            # Add constraints accordingly
+            if lb is not None:
+                vc_handle_lb = m.add_constraint(sum_vars >= float(lb), ctname="vehicle_count_lb")
+            else:
+                vc_handle_lb = None
+            if ub is not None:
+                vc_handle_ub = m.add_constraint(sum_vars <= float(ub), ctname="vehicle_count_ub")
+            else:
+                vc_handle_ub = None
+            # record handle as dict for retrieval of duals
+            vc_handle = {"lb_ct": vc_handle_lb, "ub_ct": vc_handle_ub, "lb": lb, "ub": ub}
+
+        # store built model and mappings atomically
+        self.model = m
+        self.lambda_vars = {cid: info["var"] for cid, info in lambda_vars.items()}
+        # rebuild customer constraint mapping: docplex constraints have names; retrieve the constraints by original dict
+        # We must rebuild mapping of customer -> constraint handle. We have customer_cts dict, but docplex constraints updated
+        self.customer_constraints = customer_cts
+        # update sr_cuts with constraint handles
+        for idx, sr in enumerate(self.sr_cuts):
+            sr["constraint"] = sr_handles[idx]["constraint"] if idx < len(sr_handles) else sr.get("constraint")
+        # update vehicle_count_constraint to include handles
+        if vc_handle is not None:
+            self.vehicle_count_constraint["handles"] = vc_handle
+
+        # update known column ids set
+        self._known_column_ids = set(self.lambda_vars.keys())
+        end = time.time()
+        self._log("rlmp_rebuild_model", {"n_columns": len(self._known_column_ids), "n_customers": len(self.customer_constraints), "n_sr": len(self.sr_cuts), "time_s": end - start})
+
+    # -------------------------
+    # Public API methods
+    # -------------------------
+    def seed_initial_columns(self) -> None:
+        """
+        Ensure ColumnPool contains an initial set of feasible columns that cover
+        all customers. If columns already cover all customers, do nothing.
+
+        Behavior:
+          - If ColumnPool.get_all() union of covers contains all customers, nothing to do.
+          - Else attempt to create simple truck-only single-customer routes: for each customer i
+            create route [0, i, n+1] if time-window feasible using instance.params service times.
+          - If service times missing in instance.params, raise informative error.
+        """
+        # gather current coverage
+        columns = []
+        try:
+            columns = self.column_pool.get_all()
+        except Exception:
+            columns = []
+
+        covered = set()
+        for col in columns:
+            try:
+                cov = col.route.covers() if hasattr(col, "route") else set()
+                covered.update(cov)
+            except Exception:
+                # fallback to a_ir
+                try:
+                    a_ir = getattr(col, "a_ir", {}) or {}
+                    for i, v in a_ir.items():
+                        if int(v) != 0:
+                            covered.add(int(i))
+                except Exception:
+                    continue
+
+        all_customers = set(range(1, self.instance.n + 1))
+        missing = all_customers - covered
+        if not missing:
+            self._log("seed_initial_columns", {"status": "already_covered", "n_columns": len(columns)})
+            return
+
+        # Check service times in config or instance.params
+        service_times = {}
+        svc_cfg = self.config.get("service_times", {}) or {}
+        svc_inst = self.instance.params.get("service_times", {}) if isinstance(self.instance.params, dict) else {}
+        service_times.update(svc_cfg or {})
+        service_times.update(svc_inst or {})
+        truck_st = service_times.get("truck_service_time_minutes", None)
+        drone_st = service_times.get("drone_service_time_minutes", None)
+        if truck_st is None or drone_st is None:
+            # The reproducibility plan required not to invent values; raise error instructing user
+            raise RLMPException(
+                "Cannot seed initial columns: service times not specified in config or instance.params. "
+                "Please set 'service_times.truck_service_time_minutes' and 'service_times.drone_service_time_minutes' in config.yaml "
+                "or provide initial columns via ColumnPool."
+            )
+
+        # Build DistanceMatrix wrapper to compute times (should exist elsewhere; ensure Precomputed)
+        # The instance consumer likely constructed DistanceMatrix separately; try to reuse if present in instance.params or elsewhere.
+        # We'll create a DistanceMatrix for the instance here (safe).
+        try:
+            dm = DistanceMatrix(self.instance)
+            dm.compute_all()
+        except Exception as ex:
+            raise RLMPException(f"Failed to build DistanceMatrix during seeding: {ex}")
+
+        # Create single-customer truck-only routes for missing customers
+        new_cols = []
+        for cust in sorted(list(missing)):
+            truck_seq = [0, int(cust), self.instance.n + 1]
+            drone_sorties = []
+            try:
+                route = Route(truck_seq=truck_seq, drone_sorties=drone_sorties, instance=self.instance, distances=dm, config=self.config)
+            except Exception:
+                # if construction fails skip this customer (will cause coverage missing -> error later)
+                continue
+            feasible, reason = route.is_feasible()
+            if not feasible:
+                # skip infeasible single-customer truck route
+                continue
+            try:
+                col = route.to_column()
+            except Exception:
+                # skip if cannot convert
+                continue
+            new_cols.append(col)
+
+        if not new_cols:
+            raise RLMPException("Failed to generate initial feasible single-customer truck routes to seed RLMP. "
+                                "Please provide initial columns via ColumnPool or ensure service times and time-windows make single-customer truck routes feasible.")
+
+        # add to column pool
+        try:
+            self.column_pool.add_many(new_cols)
+        except Exception:
+            # fallback to add individually
+            for c in new_cols:
+                try:
+                    self.column_pool.add(c)
+                except Exception:
+                    pass
+
+        # log seeding
+        self._log("seed_initial_columns", {"added": len(new_cols), "missing_before": len(missing)})
+
+    def sync_model_with_column_pool(self) -> None:
+        """
+        Synchronize the internal solver model with the current contents of ColumnPool.
+        Implementation strategy: rebuild the model from scratch from ColumnPool and stored SR cuts.
+        This ensures correctness and avoids complex incremental update bugs.
+
+        After calling this method, self.model, self.lambda_vars, self.customer_constraints,
+        and sr_cuts constraint handles are updated.
+        """
+        # Rebuild model from ColumnPool
+        self._build_model_from_columns()
+
+    def add_columns(self, columns: Iterable[Column]) -> None:
+        """
+        Add columns to the ColumnPool and sync model. ColumnPool deduplicates.
+        """
+        # Add to column pool
+        try:
+            self.column_pool.add_many(columns)
+        except Exception:
+            # fallback to adding individually
+            for c in columns:
+                try:
+                    self.column_pool.add(c)
+                except Exception:
+                    pass
+        # Rebuild model to include new columns
+        self.sync_model_with_column_pool()
+
+    def add_sr_cuts(self, cuts: List[SRCut]) -> None:
+        """
+        Add SR cuts to the internal storage and sync model.
+
+        cuts: list of (S_tuple, p) where S_tuple is iterable of customer indices (size = sr_cardinality typically)
+        """
+        # add to internal list with assigned id
+        for S_tuple, p in cuts:
+            S_key = tuple(sorted(int(x) for x in S_tuple))
+            sr_id = "_".join(str(x) for x in S_key)
+            # avoid duplication
+            exists = any(sr["id"] == sr_id and tuple(sr["S"]) == S_key and int(sr["p"]) == int(p) for sr in self.sr_cuts)
+            if exists:
+                continue
+            self.sr_cuts.append({"id": sr_id, "S": S_key, "p": int(p), "constraint": None})
+        # rebuild model so SR constraints are added
+        self.sync_model_with_column_pool()
+
+    def add_vehicle_count_constraint(self, lb: Optional[int] = None, ub: Optional[int] = None) -> None:
+        """
+        Add or update a vehicle-count constraint in the RLMP of the form:
+            lb <= sum_r lambda_r <= ub
+        If lb or ub is None, the corresponding bound is not enforced.
+
+        This method stores the bounds and rebuilds the model to apply them.
+        """
+        self.vehicle_count_constraint = {"lb": lb, "ub": ub, "handles": None}
+        self.sync_model_with_column_pool()
+
+    def remove_vehicle_count_constraint(self) -> None:
+        """Remove any vehicle-count constraint and rebuild model."""
+        self.vehicle_count_constraint = None
+        self.sync_model_with_column_pool()
+
+    def solve_lp(self, time_limit_seconds: Optional[float] = None) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
+        """
+        Solve the RLMP LP relaxation (λ variables continuous).
+
+        Returns:
+            obj_value: float
+            primal_lambda: dict mapping column_id -> lambda value (float)
+            duals: dict with keys:
+                - 'pi': mapping 1..n -> dual (float)
+                - 'sigma': dual associated with vehicle-count constraint (float) (0.0 if absent)
+                - 'zeta': dict mapping sr_id -> dual (float)
+                - 'pi_depot': computed (F - sigma) / 2
+                - 'status': 'optimal'|'timelimit'|'infeasible'|'error'
+        """
+        # ensure model in sync
+        self.sync_model_with_column_pool()
+        if self.model is None:
+            raise RLMPException("Internal model not built.")
+
+        m = self.model
+        # configure time limit if provided
+        if time_limit_seconds is not None:
+            try:
+                m.parameters.timelimit = float(time_limit_seconds)
+            except Exception:
+                pass
+
+        t0 = time.time()
+        status = "unknown"
+        obj_value = None
+        primal_lambda: Dict[str, float] = {}
+
+        try:
+            sol = m.solve(log_output=False)
+            t1 = time.time()
+            # if no solution returned
+            if sol is None:
+                status = "no_solution"
+            else:
+                status = str(m.get_solve_status())
+                try:
+                    obj_value = float(m.objective_value)
+                except Exception:
+                    obj_value = None
+                # extract primal lambdas
+                for cid, var in self.lambda_vars.items():
+                    try:
+                        val = float(var.solution_value) if var.solution_value is not None else 0.0
+                    except Exception:
+                        val = 0.0
+                    primal_lambda[cid] = val
+        except TimeLimitException:
+            # solver timed out; try to get incumbent LP/feasible solution if available
+            status = "timelimit"
+            try:
+                # attempt to read best available solution
+                for cid, var in self.lambda_vars.items():
+                    try:
+                        val = float(var.solution_value) if var.solution_value is not None else 0.0
+                    except Exception:
+                        val = 0.0
+                    primal_lambda[cid] = val
+                try:
+                    obj_value = float(m.objective_value) if m.objective_value is not None else None
+                except Exception:
+                    obj_value = None
+            except Exception:
+                pass
+        except Exception as ex:
+            status = "error"
+            self._log("rlmp_solve_error", {"error": str(ex)})
+            # attempt to extract any partial primal
+            try:
+                for cid, var in self.lambda_vars.items():
+                    try:
+                        val = float(var.solution_value) if var.solution_value is not None else 0.0
+                    except Exception:
+                        val = 0.0
+                    primal_lambda[cid] = val
+            except Exception:
+                pass
+
+        # Extract duals: customer constraints, SRs, vehicle-count
+        duals: Dict[str, Any] = {}
+        pi_map: Dict[int, float] = {}
+        try:
+            for i, ct in self.customer_constraints.items():
+                # docplex constraint dual value access: ct.dual_value
+                try:
+                    pi_map[int(i)] = float(ct.dual_value) if getattr(ct, "dual_value", None) is not None else 0.0
+                except Exception:
+                    # some docplex versions use ct.dual_value; if not available set 0.0
+                    try:
+                        pi_map[int(i)] = float(ct.get_solution_value())  # fallback unlikely
+                    except Exception:
+                        pi_map[int(i)] = 0.0
+        except Exception:
+            # if extraction fails, default to zeros
+            for i in range(1, self.instance.n + 1):
+                pi_map[i] = 0.0
+
+        # SR duals
+        zeta_map: Dict[str, float] = {}
+        for sr in self.sr_cuts:
+            try:
+                constr = sr.get("constraint")
+                if constr is not None and getattr(constr, "dual_value", None) is not None:
+                    zeta_map[sr["id"]] = float(constr.dual_value)
+                else:
+                    zeta_map[sr["id"]] = 0.0
+            except Exception:
+                zeta_map[sr["id"]] = 0.0
+
+        # vehicle-count dual: if present, we may have two constraints lb and ub; convention: use dual of ub if exists else -dual of lb? To be practical, take ub dual if exists else lb dual (negated handle depending on inequality sign).
+        sigma = 0.0
+        if self.vehicle_count_constraint is not None:
+            handles = self.vehicle_count_constraint.get("handles", {})
+            # if ub constraint exists
+            ub_ct = None
+            lb_ct = None
+            if isinstance(handles, dict):
+                ub_ct = handles.get("ub_ct", None)
+                lb_ct = handles.get("lb_ct", None)
+            # prefer ub dual
+            try:
+                if ub_ct is not None and getattr(ub_ct, "dual_value", None) is not None:
+                    sigma = float(ub_ct.dual_value)
+                elif lb_ct is not None and getattr(lb_ct, "dual_value", None) is not None:
+                    sigma = float(lb_ct.dual_value)
+                else:
+                    sigma = 0.0
+            except Exception:
+                sigma = 0.0
+        else:
+            sigma = 0.0
+
+        # compute depot pi as (F - sigma)/2 per paper
+        try:
+            pi_depot = (float(self.F) - float(sigma)) / 2.0
+        except Exception:
+            pi_depot = 0.0
+
+        # assemble duals
+        duals["pi"] = pi_map
+        duals["sigma"] = float(sigma)
+        duals["zeta"] = zeta_map
+        duals["pi_depot"] = float(pi_depot)
+        duals["status"] = status
+
+        # also include pi_0 and pi_n+1 explicit entries for convenience
+        try:
+            duals["pi_0"] = float(pi_depot)
+            duals[f"pi_{self.instance.n + 1}"] = float(pi_depot)
+        except Exception:
+            pass
+
+        # record last solve info
+        self._last_solve_info = {"status": status, "obj": obj_value, "time_s": time.time() - t0, "n_columns": len(self.lambda_vars), "n_sr": len(self.sr_cuts)}
+
+        # logging
+        self._log("rlmp_solve_lp", {"status": status, "obj": obj_value, "n_columns": len(self.lambda_vars), "n_sr": len(self.sr_cuts), "time_s": time.time() - t0})
+
+        return (obj_value if obj_value is not None else float("inf"), primal_lambda, duals)
+
+    def solve_ip(self, time_limit: Optional[float] = None) -> Tuple[Optional[float], Optional[Dict[str, int]]]:
+        """
+        Solve the integer restricted master (λ_r binary) over the current ColumnPool.
+
+        Implementation rebuilds a MIP from scratch (binary lambda variables) to avoid
+        mutating the LP model in-place.
+
+        Returns:
+            (objective_value (float) or None if no feasible integer solution found,
+             integer_solution dict mapping column_id -> 0/1) or (None, None) on failure.
+        """
+        # prepare columns from column_pool
+        try:
+            columns = self.column_pool.get_all()
+        except Exception:
+            columns = []
+
+        if not columns:
+            return None, None
+
+        # build MIP model
+        m = Model(name="RLMP_integer_restricted")
+        # set threads/time-limit
+        try:
+            m.parameters.threads = int(self.config.get("solver", {}).get("threads", 1))
+        except Exception:
+            pass
+        if time_limit is not None:
+            try:
+                m.parameters.timelimit = float(time_limit)
+            except Exception:
+                pass
+
+        # variables: binary lambda
+        lambda_vars: Dict[str, Any] = {}
+        for col in columns:
+            cid = getattr(col, "route_id", None) or f"col_{id(col)}"
+            cid = str(cid)
+            var = m.binary_var(name=f"lambda_bin_{cid}")
+            lambda_vars[cid] = {"var": var, "col": col}
+        # customer constraints: sum a_ir * var == 1
+        for i in range(1, self.instance.n + 1):
+            expr_terms = []
+            for cid, info in lambda_vars.items():
+                col = info["col"]
+                a_ir = {}
+                if hasattr(col, "a_ir") and isinstance(getattr(col, "a_ir"), dict):
+                    a_ir = getattr(col, "a_ir")
+                else:
+                    try:
+                        cov = col.route.covers()
+                        for node in cov:
+                            a_ir[int(node)] = 1
+                    except Exception:
+                        a_ir = {}
+                coeff = float(a_ir.get(i, 0.0))
+                if coeff != 0.0:
+                    expr_terms.append(coeff * info["var"])
+            if expr_terms:
+                m.add_constraint(m.sum(expr_terms) == 1.0, ctname=f"cover_int_{i}")
+            else:
+                # no column covers this customer -> infeasible IP
+                return None, None
+
+        # SR cuts
+        for sr in self.sr_cuts:
+            S = tuple(sr["S"])
+            p = int(sr["p"])
+            rhs = math.floor(len(S) / p)
+            expr_terms = []
+            for cid, info in lambda_vars.items():
+                col = info["col"]
+                a_ir = getattr(col, "a_ir", {}) if hasattr(col, "a_ir") else {}
+                # sum over i in S of a_ir
+                summ = 0.0
+                for i in S:
+                    summ += float(a_ir.get(i, 0.0))
+                coeff = (1.0 / float(p)) * summ
+                if coeff != 0.0:
+                    expr_terms.append(coeff * info["var"])
+            if expr_terms:
+                m.add_constraint(m.sum(expr_terms) <= float(rhs), ctname=f"SR_int_{sr['id']}")
+
+        # vehicle-count constraint if present
+        if self.vehicle_count_constraint is not None:
+            lb = self.vehicle_count_constraint.get("lb", None)
+            ub = self.vehicle_count_constraint.get("ub", None)
+            expr = m.sum(info["var"] for info in lambda_vars.values())
+            if lb is not None:
+                m.add_constraint(expr >= float(lb), ctname="vehicle_count_int_lb")
+            if ub is not None:
+                m.add_constraint(expr <= float(ub), ctname="vehicle_count_int_ub")
+
+        # objective
+        obj_terms = []
+        for cid, info in lambda_vars.items():
+            col = info["col"]
+            try:
+                c_r = float(col.cost)
+            except Exception:
+                try:
+                    c_r = float(col.route.cost())
+                except Exception:
+                    c_r = float("inf")
+            obj_terms.append(c_r * info["var"])
+        if obj_terms:
+            m.minimize(m.sum(obj_terms))
+        else:
+            m.minimize(0.0)
+
+        # solve
+        try:
+            sol = m.solve(log_output=False)
+            if sol is None:
+                # no feasible integer solution found within time limit
+                return None, None
+            # extract solution
+            obj_val = float(m.objective_value) if m.objective_value is not None else None
+            integer_solution: Dict[str, int] = {}
+            for cid, info in lambda_vars.items():
+                try:
+                    val = int(round(info["var"].solution_value))
+                except Exception:
+                    val = 0
+                integer_solution[cid] = int(val)
+            return obj_val, integer_solution
+        except Exception:
+            # on solver errors/timeouts, attempt best sol extraction if possible
+            try:
+                obj_val = float(m.objective_value) if m.objective_value is not None else None
+                integer_solution: Dict[str, int] = {}
+                for cid, info in lambda_vars.items():
+                    try:
+                        val = int(round(info["var"].solution_value)) if info["var"].solution_value is not None else 0
+                    except Exception:
+                        val = 0
+                    integer_solution[cid] = int(val)
+                return obj_val, integer_solution
+            except Exception:
+                return None, None

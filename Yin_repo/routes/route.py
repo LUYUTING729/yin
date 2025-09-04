@@ -1,0 +1,716 @@
+## routes/route.py
+
+"""
+routes/route.py
+
+Implementation of the Route domain object and a lightweight Column class for the
+TD-DRPTW reproduction project.
+
+The Route class represents a synthetic-route: an ordered truck route (truck_seq)
+plus zero or more drone sorties. It provides:
+  - covers(): set of customers served by this route
+  - cost(): total operating cost for this route (F + c_t * truck_time_sum + c_d * drone_time_sum)
+  - is_feasible(): feasibility check w.r.t. capacities, time windows, drone flight time, and truck duration
+  - to_column(): produce a Column object that can be consumed by the RLMP/ColumnPool
+  - serialize(): JSON-serializable diagnostic representation including schedule if feasible
+
+Important implementation notes (must be consistent with design and other modules):
+  - This module expects the geometry.DistanceMatrix instance to have compute_all() called
+    or will call compute_all() lazily when needed. DistanceMatrix provides:
+        - t_truck(i, j): travel time (minutes) including service time at j
+        - t_drone(i, j): travel time (minutes) including service time at j (or np.inf if drone not allowed to arrive at j)
+        - d_drone(i, j), d_truck(i, j) available but not required here.
+        - service_time_truck: numpy array of service times per node (in node order)
+        - service_time_drone: numpy array of service times per node
+        - node_index_map: mapping node -> index into arrays/matrices
+    The Route implementation uses t_truck and t_drone as provided, and extracts
+    per-node service times by subtracting (if needed) to obtain travel-only components.
+
+  - Configuration parameters (required):
+        config (dict) must provide or instance.params must contain:
+           problem_parameters: Q_t, Q_d, L_t, L_d
+           cost_parameters: fixed_vehicle_cost_F, truck_cost_per_min_c_t, drone_cost_per_min_c_d
+           service_times: truck_service_time_minutes, drone_service_time_minutes
+    If any are missing the Route constructor or is_feasible will raise ValueError.
+
+Author: Reproducibility codebase
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Sequence, Tuple
+
+import numpy as np
+
+# Import Instance and DistanceMatrix types for type-checking and usage
+from instances.instance import Instance
+from geometry.distances import DistanceMatrix
+
+# Type aliases
+Node = int
+Coord = Tuple[float, float]
+TimeWindow = Tuple[float, float]
+
+
+@dataclass
+class Column:
+    """
+    Lightweight Column container expected by ColumnPool / RLMP.
+
+    Fields:
+      - route_id: unique string id for the route/column
+      - route: reference to Route object (keeps memory link)
+      - a_ir: dict[int, int] mapping customer index -> 1/0 indicating coverage
+      - cost: float total operating cost c_r
+      - truck_arcs: list[ (i, j) ] arcs traversed by truck
+      - drone_arcs: list[ (i, j) ] arcs traversed by drone sorties
+    """
+
+    route_id: str
+    route: "Route"
+    a_ir: Dict[int, int]
+    cost: float
+    truck_arcs: List[Tuple[int, int]]
+    drone_arcs: List[Tuple[int, int]]
+
+    def contains_arc(self, i: int, j: int) -> bool:
+        """Return True if arc (i,j) is used either by the truck or any drone sortie."""
+        return (i, j) in self.truck_arcs or (i, j) in self.drone_arcs
+
+    def serialize(self) -> Dict[str, Any]:
+        """Return JSON-serializable representation of the column (route summary)."""
+        return {
+            "route_id": self.route_id,
+            "cost": float(self.cost),
+            "coverage": [i for i, v in sorted(self.a_ir.items()) if v == 1],
+            "num_truck_arcs": len(self.truck_arcs),
+            "num_drone_arcs": len(self.drone_arcs),
+            "truck_arcs": list(self.truck_arcs),
+            "drone_arcs": list(self.drone_arcs),
+        }
+
+
+class Route:
+    """
+    Represents a synthetic-route: truck route sequence + list of drone sorties.
+
+    Constructor arguments:
+      - truck_seq: ordered list of node indices visited by truck (includes depot 0 and n+1)
+      - drone_sorties: list of tuples (sep_node, [customer_seq], rendezvous_node)
+      - instance: Instance object (provides demands, time windows, D)
+      - distances: DistanceMatrix object (precomputed or will be computed lazily)
+      - config: dict-like configuration (should match config.yaml structure). If None,
+                attempt to derive necessary params from instance.params; required entries
+                must be present or an exception is raised.
+
+    Public methods:
+      - covers() -> Set[int]
+      - cost() -> float
+      - is_feasible() -> (bool, Optional[str])
+      - to_column() -> Column
+      - serialize() -> dict
+    """
+
+    def __init__(
+        self,
+        truck_seq: Sequence[Node],
+        drone_sorties: Sequence[Tuple[Node, Sequence[Node], Node]],
+        instance: Instance,
+        distances: DistanceMatrix,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        # Basic assignment and shallow validation
+        if truck_seq is None or len(truck_seq) < 2:
+            raise ValueError("truck_seq must be a sequence with at least origin and end depot (0 and n+1).")
+        self.truck_seq: List[int] = [int(x) for x in truck_seq]
+        self.drone_sorties: List[Tuple[int, List[int], int]] = [
+            (int(s), [int(u) for u in customers], int(r)) for (s, customers, r) in drone_sorties
+        ]
+        self.instance = instance
+        self.distances = distances
+        self.config = config or {}
+
+        # Validate consistency of nodes with instance
+        expected_nodes = list(range(0, self.instance.n + 2))
+        for node in self.truck_seq:
+            if node not in expected_nodes:
+                raise ValueError(f"truck_seq contains invalid node {node} for instance with n={self.instance.n}")
+
+        # Ensure separation/rendezvous nodes are in truck_seq and indices valid
+        truck_positions = {node: idx for idx, node in enumerate(self.truck_seq)}
+        for sep, custs, r in self.drone_sorties:
+            if sep not in truck_positions:
+                raise ValueError(f"drone sortie separation node {sep} not present in truck_seq")
+            if r not in truck_positions:
+                raise ValueError(f"drone sortie rendezvous node {r} not present in truck_seq")
+            if truck_positions[sep] >= truck_positions[r]:
+                raise ValueError(f"drone sortie has rendezvous {r} before separation {sep} in truck_seq")
+            # All drone-customer indices must be valid and drone-eligible
+            for u in custs:
+                if not (1 <= u <= self.instance.n):
+                    raise ValueError(f"drone sortie customer {u} is not a valid customer index")
+                if u not in self.instance.D:
+                    raise ValueError(f"drone sortie customer {u} is not drone-eligible (not in instance.D)")
+
+        # Lazy place-holders for schedule computed by is_feasible
+        self._cached_feasibility: Optional[Tuple[bool, Optional[str], Dict[str, Any]]] = None
+        # route id created lazily
+        self._route_id: Optional[str] = None
+
+        # Validate distances: ensure compute_all() has been called or call it lazily
+        if not getattr(self.distances, "_computed", False):
+            # compute lazily; but may raise if distances requires config
+            try:
+                self.distances.compute_all()
+            except Exception as ex:
+                # Raise clear message: distances.compute_all failed
+                raise RuntimeError(f"DistanceMatrix.compute_all() failed when constructing Route: {ex}") from ex
+
+    # -------------------------
+    # Utilities / helpers
+    # -------------------------
+    def _get_problem_param(self, key: str) -> Any:
+        """
+        Try to obtain a problem-level parameter from provided config first,
+        then fallback to instance.params.problem_parameters or instance.params top-level.
+
+        Raises ValueError if the parameter is missing.
+        """
+        # Search in config top-level keys (matching config.yaml structure)
+        if self.config and key in self.config.get("problem_parameters", {}):
+            return self.config["problem_parameters"][key]
+        if self.config and key in self.config:
+            return self.config[key]
+        # instance.params may have nested problem_parameters
+        params = self.instance.params or {}
+        if isinstance(params.get("problem_parameters"), dict) and key in params.get("problem_parameters", {}):
+            return params["problem_parameters"][key]
+        if key in params:
+            return params[key]
+        # final fallback: top-level config keys (older representation)
+        if self.config and key in self.config.get("problem_parameters", {}):
+            return self.config["problem_parameters"][key]
+        raise ValueError(f"Required problem parameter '{key}' not found in route config or instance.params. Please set it in config.yaml.")
+
+    def _get_cost_param(self, key: str) -> Any:
+        """
+        Retrieve cost parameters from config or instance.params['cost_parameters'].
+        """
+        if self.config and "cost_parameters" in self.config and key in self.config["cost_parameters"]:
+            return self.config["cost_parameters"][key]
+        params = self.instance.params or {}
+        if isinstance(params.get("cost_parameters"), dict) and key in params.get("cost_parameters", {}):
+            return params["cost_parameters"][key]
+        # fallback to top-level
+        if key in self.config:
+            return self.config[key]
+        raise ValueError(f"Required cost parameter '{key}' not found in config or instance.params.")
+
+    def _get_service_times(self) -> Tuple[float, float]:
+        """
+        Return (truck_service_time_minutes, drone_service_time_minutes).
+        Prefer config.service_times, otherwise instance.params['service_times'].
+
+        Raises ValueError if missing.
+        """
+        if self.config and "service_times" in self.config:
+            st = self.config["service_times"]
+            ts = st.get("truck_service_time_minutes")
+            ds = st.get("drone_service_time_minutes")
+            if ts is not None and ds is not None:
+                return float(ts), float(ds)
+        # fallback to instance.params
+        params = self.instance.params or {}
+        if isinstance(params.get("service_times"), dict):
+            st2 = params.get("service_times")
+            ts = st2.get("truck_service_time_minutes")
+            ds = st2.get("drone_service_time_minutes")
+            if ts is not None and ds is not None:
+                return float(ts), float(ds)
+        # Final fallback: maybe service times are embedded in distances.service arrays -> use those values for a single node check
+        # But we must not invent values; raise error to comply with instruction.
+        raise ValueError(
+            "Service times (truck_service_time_minutes and drone_service_time_minutes) are not specified in config or instance.params['service_times']. "
+            "The Route class requires explicit service time configuration (see config.yaml)."
+        )
+
+    def _compute_route_id(self) -> str:
+        """Deterministically compute a route id (sha1 of serialized structure)."""
+        if self._route_id is not None:
+            return self._route_id
+        # Serialize minimal identifying info
+        payload = {
+            "truck_seq": self.truck_seq,
+            "drone_sorties": [[s, list(c), r] for (s, c, r) in self.drone_sorties],
+            "instance_id": getattr(self.instance, "id", None),
+        }
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        h = hashlib.sha1(raw).hexdigest()[:16]
+        self._route_id = f"route_{h}"
+        return self._route_id
+
+    def compute_truck_arcs(self) -> List[Tuple[int, int]]:
+        """Return list of directed truck arcs in order for truck_seq."""
+        arcs: List[Tuple[int, int]] = []
+        seq = self.truck_seq
+        for i in range(len(seq) - 1):
+            arcs.append((seq[i], seq[i + 1]))
+        return arcs
+
+    def compute_drone_arcs(self) -> List[Tuple[int, int]]:
+        """Return list of directed drone arcs across all sorties (concatenate sortie arcs)."""
+        arcs: List[Tuple[int, int]] = []
+        for sep, custs, r in self.drone_sorties:
+            prev = sep
+            for u in custs:
+                arcs.append((prev, u))
+                prev = u
+            # final leg to rendezvous
+            arcs.append((prev, r))
+        return arcs
+
+    # -------------------------
+    # Core public methods
+    # -------------------------
+    def covers(self) -> Set[int]:
+        """
+        Return set of customer indices covered by this synthetic-route (either by truck or drone).
+
+        Ensures each customer is covered at most once within the route; raises ValueError on internal inconsistency.
+        """
+        truck_customers: Set[int] = {node for node in self.truck_seq if 1 <= node <= self.instance.n}
+        drone_customers: Set[int] = set()
+        for sep, custs, r in self.drone_sorties:
+            for u in custs:
+                drone_customers.add(int(u))
+
+        # If a customer appears in both truck_customers and drone_customers -> inconsistent
+        overlap = truck_customers & drone_customers
+        if overlap:
+            # It is possible a node appears in truck_seq only as a rendezvous (not intended to be truck-served).
+            # We cannot reliably disambiguate here: raise explicit error to force upstream to construct route unambiguously.
+            raise ValueError(f"Inconsistent route: customers {sorted(list(overlap))} appear both in truck_seq and as drone-served customers. Each customer must be served exactly once in a route.")
+        covered = truck_customers.union(drone_customers)
+        return covered
+
+    def cost(self) -> float:
+        """
+        Compute total operating cost c_r = F + c_t * truck_travel_minutes_sum + c_d * drone_travel_minutes_sum.
+
+        Uses DistanceMatrix.t_truck(i,j) and t_drone(i,j) which by design include arrival service time at destination.
+        """
+        # obtain cost params (may raise informative error if missing)
+        F = float(self._get_cost_param("fixed_vehicle_cost_F"))
+        c_t = float(self._get_cost_param("truck_cost_per_min_c_t"))
+        c_d = float(self._get_cost_param("drone_cost_per_min_c_d"))
+
+        truck_time_sum = 0.0
+        for (i, j) in self.compute_truck_arcs():
+            tt = float(self.distances.t_truck(i, j))
+            if not math.isfinite(tt):
+                # treat as infeasible/time infinite -> cost infinite
+                return float("inf")
+            truck_time_sum += tt
+
+        drone_time_sum = 0.0
+        # for drone arcs, the distances.t_drone may be np.inf if drone cannot arrive at some node (ineligible)
+        for (i, j) in self.compute_drone_arcs():
+            td = float(self.distances.t_drone(i, j))
+            if not math.isfinite(td):
+                return float("inf")
+            drone_time_sum += td
+
+        total_cost = float(F) + float(c_t) * float(truck_time_sum) + float(c_d) * float(drone_time_sum)
+        return total_cost
+
+    def is_feasible(self) -> Tuple[bool, Optional[str]]:
+        """
+        Perform feasibility check and compute earliest-start schedule.
+
+        Returns (True, None) if feasible; otherwise (False, reason_string).
+
+        The method caches its result for repeated calls; subsequent calls return cached result
+        unless the Route object is modified externally (which is not expected).
+        """
+        if self._cached_feasibility is not None:
+            ok, reason, _sched = self._cached_feasibility
+            return ok, reason
+
+        try:
+            # Validate presence of required parameters
+            Q_t = float(self._get_problem_param("Q_t"))
+            Q_d = float(self._get_problem_param("Q_d"))
+            L_t = float(self._get_problem_param("L_t"))
+            L_d = float(self._get_problem_param("L_d"))
+
+            # cost and service times validated lazily
+            truck_service_time_cfg, drone_service_time_cfg = self._get_service_times()
+        except Exception as ex:
+            # Missing configuration
+            reason = f"Configuration error: {ex}"
+            self._cached_feasibility = (False, reason, {})
+            return False, reason
+
+        # Pre-check capacities quickly
+        try:
+            covered_customers = self.covers()
+        except Exception as ex:
+            reason = f"Inconsistent coverage: {ex}"
+            self._cached_feasibility = (False, reason, {})
+            return False, reason
+
+        # Sum demands for total load
+        total_demand = 0
+        for i in covered_customers:
+            total_demand += int(self.instance.demands[i])
+        if total_demand > Q_t + 1e-9:
+            reason = f"Total demand {total_demand} exceeds truck capacity Q_t={Q_t}"
+            self._cached_feasibility = (False, reason, {})
+            return False, reason
+
+        # For each sortie, check sum <= Q_d
+        for sep, custs, r in self.drone_sorties:
+            ssum = sum(int(self.instance.demands[u]) for u in custs)
+            if ssum > Q_d + 1e-9:
+                reason = f"Drone sortie at separation node {sep} carries demand {ssum} > Q_d={Q_d}"
+                self._cached_feasibility = (False, reason, {})
+                return False, reason
+
+        # Build helper maps
+        truck_pos = {node: idx for idx, node in enumerate(self.truck_seq)}
+        # mapping rendezvous node -> list of drone_return_times to be filled when drone simulated
+        rendezvous_return_times: Dict[int, float] = {}
+
+        # Precompute per-node service times using distances.service arrays if available, else use cfg values
+        # distances.service_time_truck is numpy array in node order; we map node -> service time
+        svc_truck = {}
+        svc_drone = {}
+        if hasattr(self.distances, "service_time_truck") and getattr(self.distances, "service_time_truck") is not None:
+            # distances has arrays indexed by distances.node_index_map
+            for node in self.distances.node_index_map:
+                idx = self.distances.node_index_map[node]
+                svc_truck[node] = float(self.distances.service_time_truck[idx])
+                svc_drone[node] = float(self.distances.service_time_drone[idx])
+        else:
+            # fallback to config-provided constant service times (should not happen because distances.compute_all used them)
+            for node in self.truck_seq:
+                svc_truck[node] = float(truck_service_time_cfg)
+                svc_drone[node] = float(drone_service_time_cfg)
+
+        # For safety, override svc_truck/drone at customer nodes with cfg if distances arrays missing
+        # (we already set from distances or config above)
+
+        # Precompute quick lookup of which customers are served by drone versus truck
+        drone_customers: Set[int] = set()
+        for sep, custs, r in self.drone_sorties:
+            for u in custs:
+                drone_customers.add(int(u))
+        # truck customers are customers in truck_seq excluding drone_customers
+        truck_customers: Set[int] = {node for node in self.truck_seq if 1 <= node <= self.instance.n and node not in drone_customers}
+
+        # Simulation variables
+        # Start at depot earliest
+        depot_tw = self.instance.time_windows[0]
+        truck_time = float(depot_tw[0]) if depot_tw is not None else 0.0
+        truck_load = float(total_demand)  # truck initially carries all demands for route (both truck and drone portions)
+
+        # Prepare schedule recording
+        truck_schedule: List[Dict[str, Any]] = []
+        drone_sortie_schedules: List[Dict[str, Any]] = []
+
+        # Build mapping from separation node -> list of sortie indices starting at that node
+        sep_to_sorties: Dict[int, List[int]] = {}
+        for idx, (sep, custs, r) in enumerate(self.drone_sorties):
+            sep_to_sorties.setdefault(int(sep), []).append(idx)
+
+        # Also mapping rendezvous -> list of sortie indices rejoining there (for waiting)
+        r_to_sorties: Dict[int, List[int]] = {}
+        for idx, (sep, custs, r) in enumerate(self.drone_sorties):
+            r_to_sorties.setdefault(int(r), []).append(idx)
+
+        # Helper to compute travel_no_service for truck/drone: subtract service time at destination
+        def truck_travel_no_service(i: int, j: int) -> float:
+            tt = float(self.distances.t_truck(i, j))
+            # subtract service time at j (if distances includes service)
+            st = svc_truck.get(j, 0.0)
+            travel_only = tt - float(st)
+            # numeric safety
+            if travel_only < 0.0:
+                travel_only = 0.0
+            return travel_only
+
+        def drone_travel_no_service(i: int, j: int) -> float:
+            td = float(self.distances.t_drone(i, j))
+            st = svc_drone.get(j, 0.0)
+            # If drone arrival infeasible, distances.t_drone returns inf
+            if not math.isfinite(td):
+                return float("inf")
+            travel_only = td - float(st)
+            if travel_only < 0.0:
+                travel_only = 0.0
+            return travel_only
+
+        # Iterate through truck sequence
+        seq = self.truck_seq
+        for idx in range(len(seq)):
+            node = seq[idx]
+            # When idx == 0 (depot origin) we don't have arrival travel, but truck_time already set to depot earliest
+            if idx == 0:
+                arrival = truck_time
+            else:
+                prev = seq[idx - 1]
+                travel_no_srv = truck_travel_no_service(prev, node)
+                arrival = truck_time + travel_no_srv
+
+            # Earliest service start considering TW
+            tw_e, tw_l = self.instance.time_windows.get(node, (0.0, float("inf")))
+            service_start = max(arrival, float(tw_e))
+            # If node is a customer and service_start > latest, infeasible
+            if 1 <= node <= self.instance.n and service_start > float(tw_l) + 1e-9:
+                reason = f"Truck arrives at customer {node} at earliest-start {service_start:.3f} > latest {tw_l:.3f}"
+                self._cached_feasibility = (False, reason, {"truck_schedule_partial": truck_schedule})
+                return False, reason
+
+            # Truck service time at node (from svc_truck)
+            service_time_here = float(svc_truck.get(node, float(truck_service_time_cfg)))
+            service_end = service_start + service_time_here
+
+            # If any drone sorties separate at this node, they depart at truck departure time
+            # (truck departure may later be delayed to wait for drones' rendezvous, but drone departure equals service_end)
+            if node in sep_to_sorties:
+                sortie_indices = sep_to_sorties[node]
+                for sidx in sortie_indices:
+                    sep_node, custs, rendezvous_node = self.drone_sorties[sidx]
+                    # Drone departs at service_end
+                    drone_departure = float(service_end)
+                    # Simulate drone route earliest schedule
+                    drone_events = []
+                    cur_t = drone_departure
+                    prev_point = sep_node
+                    feasible_sortie = True
+                    for u in custs:
+                        # travel to u
+                        t_no_srv = drone_travel_no_service(prev_point, u)
+                        if not math.isfinite(t_no_srv):
+                            feasible_sortie = False
+                            reason = f"Drone cannot travel from {prev_point} to {u} (ineligible arrival)"
+                            self._cached_feasibility = (False, reason, {"sortie_index": sidx})
+                            return False, reason
+                        arrival_u = cur_t + t_no_srv
+                        e_u, l_u = self.instance.time_windows.get(u, (0.0, float("inf")))
+                        start_u = max(arrival_u, float(e_u))
+                        if start_u > float(l_u) + 1e-9:
+                            feasible_sortie = False
+                            reason = f"Drone sortie starting at {sep_node}: service at customer {u} cannot start before latest {l_u:.3f} (earliest possible {start_u:.3f})"
+                            self._cached_feasibility = (False, reason, {"sortie_index": sidx})
+                            return False, reason
+                        serv_u = float(svc_drone.get(u, float(drone_service_time_cfg)))
+                        end_u = start_u + serv_u
+                        drone_events.append({"node": u, "arrival": arrival_u, "start": start_u, "end": end_u})
+                        cur_t = end_u
+                        prev_point = u
+                    # travel from last customer (or sep if none) to rendezvous
+                    t_no_srv_final = drone_travel_no_service(prev_point, rendezvous_node)
+                    if not math.isfinite(t_no_srv_final):
+                        reason = f"Drone cannot travel from {prev_point} to rendezvous {rendezvous_node} (ineligible arrival)"
+                        self._cached_feasibility = (False, reason, {"sortie_index": sidx})
+                        return False, reason
+                    arrival_r = cur_t + t_no_srv_final
+                    # If rendezvous is a customer that drone serves, we must check its TW (drone service arrival included above if drone visited it),
+                    # But usually rendezvous node may be also served by truck; we only need to ensure drone can arrive
+                    # Compute drone flight duration
+                    flight_duration = arrival_r - drone_departure
+                    if flight_duration > float(L_d) + 1e-9:
+                        reason = f"Drone sortie starting at {sep_node} exceeds battery life L_d={L_d} (flight duration {flight_duration:.3f})"
+                        self._cached_feasibility = (False, reason, {"sortie_index": sidx})
+                        return False, reason
+                    # Save drone return time for synchronization at rendezvous_node
+                    # If multiple sorties rejoin at same rendezvous, take max when truck arrives
+                    prev_r_time = rendezvous_return_times.get(rendezvous_node)
+                    if prev_r_time is None or arrival_r > prev_r_time:
+                        rendezvous_return_times[rendezvous_node] = arrival_r
+                    # record drone sortie schedule
+                    drone_sortie_schedules.append(
+                        {
+                            "sep": sep_node,
+                            "customers": drone_events,
+                            "rendezvous": rendezvous_node,
+                            "drone_departure": drone_departure,
+                            "drone_return_time": arrival_r,
+                            "flight_duration": flight_duration,
+                        }
+                    )
+                    # Decrease truck load immediately as drone takes its parcels at separation
+                    ssum = sum(int(self.instance.demands[u]) for u in custs)
+                    truck_load -= float(ssum)
+                    if truck_load < -1e-6:
+                        reason = f"Truck load negative after drone pickup at sep {sep_node}; check demands/assignment"
+                        self._cached_feasibility = (False, reason, {})
+                        return False, reason
+
+            # If the truck serves this customer (in truck_customers), perform service and reduce load
+            if node in truck_customers:
+                # Check service start respects latest
+                if service_start > float(self.instance.time_windows[node][1]) + 1e-9:
+                    reason = f"Truck cannot start service at customer {node} before latest {self.instance.time_windows[node][1]:.3f} (earliest possible {service_start:.3f})"
+                    self._cached_feasibility = (False, reason, {"node": node})
+                    return False, reason
+                # reduce truck load
+                truck_load -= float(self.instance.demands[node])
+                if truck_load < -1e-6:
+                    reason = f"Truck load negative after serving customer {node}"
+                    self._cached_feasibility = (False, reason, {"node": node})
+                    return False, reason
+
+            # Compute truck departure time: must wait for any drone rejoining at this node
+            # default departure without waiting
+            truck_departure_nominal = float(service_end)
+            # If rendezvous_return_times has entry for this node, truck must not depart before that return time
+            rejoin_time = rendezvous_return_times.get(node)
+            if rejoin_time is not None and rejoin_time > truck_departure_nominal:
+                truck_departure = float(rejoin_time)
+            else:
+                truck_departure = float(truck_departure_nominal)
+
+            # Record truck schedule event
+            truck_schedule.append(
+                {
+                    "node": node,
+                    "arrival": float(arrival),
+                    "service_start": float(service_start),
+                    "service_end": float(service_end),
+                    "departure": float(truck_departure),
+                    "load_after_departure": float(max(truck_load, 0.0)),
+                }
+            )
+
+            # Advance truck_time to departure
+            truck_time = float(truck_departure)
+
+        # After finishing truck_seq, truck_time is arrival/departure at final depot (n+1). Check L_t
+        final_depot_node = self.instance.n + 1
+        final_arrival_time = truck_schedule[-1]["arrival"] if truck_schedule else truck_time
+        final_departure_time = truck_schedule[-1]["departure"] if truck_schedule else truck_time
+        # Use departure time as route end time; check ≤ L_t
+        if final_departure_time > float(L_t) + 1e-9:
+            reason = f"Truck route duration exceeds L_t={L_t} (departure at end depot {final_departure_time:.3f})"
+            self._cached_feasibility = (False, reason, {"truck_schedule": truck_schedule, "drone_sorties": drone_sortie_schedules})
+            return False, reason
+
+        # Ensure drone sorties' customer service starts satisfy time windows (we checked during simulation)
+        # Final consistency: every covered customer must have been served exactly once by either truck or drone
+        served_by_drone = set()
+        for ds in drone_sortie_schedules:
+            for ev in ds["customers"]:
+                served_by_drone.add(int(ev["node"]))
+        served_by_truck = set(node for node in self.truck_seq if 1 <= node <= self.instance.n and node not in served_by_drone)
+        if served_by_drone & served_by_truck:
+            reason = f"Customer(s) {sorted(list(served_by_drone & served_by_truck))} appear both in drone and truck served sets"
+            self._cached_feasibility = (False, reason, {"truck_schedule": truck_schedule, "drone_sorties": drone_sortie_schedules})
+            return False, reason
+        # Also ensure total served matches covers()
+        if (served_by_drone | served_by_truck) != set(covered_customers):
+            missing = set(covered_customers) - (served_by_drone | served_by_truck)
+            reason = f"Route does not serve customers {sorted(list(missing))} though listed in coverage"
+            self._cached_feasibility = (False, reason, {"truck_schedule": truck_schedule, "drone_sorties": drone_sortie_schedules})
+            return False, reason
+
+        # If we reach here, route is feasible
+        schedule = {"truck_schedule": truck_schedule, "drone_sorties": drone_sortie_schedules}
+        self._cached_feasibility = (True, None, schedule)
+        return True, None
+
+    def to_column(self) -> Column:
+        """
+        Convert this Route into a Column object suitable for RLMP and ColumnPool.
+
+        Asserts the route is feasible; raises ValueError if not feasible.
+        """
+        feasible, reason = self.is_feasible()
+        if not feasible:
+            raise ValueError(f"Cannot create Column from infeasible Route: {reason}")
+
+        route_id = self._compute_route_id()
+        covered = self.covers()
+        a_ir = {i: 1 if i in covered else 0 for i in range(1, self.instance.n + 1)}
+        c_r = float(self.cost())
+        truck_arcs = self.compute_truck_arcs()
+        drone_arcs = self.compute_drone_arcs()
+        return Column(route_id=route_id, route=self, a_ir=a_ir, cost=c_r, truck_arcs=truck_arcs, drone_arcs=drone_arcs)
+
+    def serialize(self) -> Dict[str, Any]:
+        """
+        Return a JSON-serializable diagnostic dict describing this Route, including computed schedule if feasible.
+        """
+        route_id = self._compute_route_id()
+        truck_arcs = self.compute_truck_arcs()
+        drone_arcs = self.compute_drone_arcs()
+        try:
+            feasible, reason = self.is_feasible()
+            _, _, schedule = self._cached_feasibility
+        except Exception:
+            feasible = False
+            reason = "feasibility check failed"
+            schedule = {}
+
+        data = {
+            "route_id": route_id,
+            "truck_seq": list(self.truck_seq),
+            "drone_sorties": [{"sep": s, "customers": list(c), "rendezvous": r} for (s, c, r) in self.drone_sorties],
+            "covered_customers": sorted(list(self.covers())) if feasible else None,
+            "feasible": bool(feasible),
+            "feasibility_reason": reason,
+            "cost": None,
+            "truck_arcs": truck_arcs,
+            "drone_arcs": drone_arcs,
+            "schedule": schedule,
+        }
+        if feasible:
+            try:
+                data["cost"] = float(self.cost())
+            except Exception:
+                data["cost"] = None
+        return data
+
+
+# Minimal test when executed as script (not exhaustive)
+if __name__ == "__main__":  # pragma: no cover - demo
+    # This demonstration requires that an Instance and DistanceMatrix be available.
+    # It is purposely minimal and for module-level smoke test only.
+    from instances.instance import Instance
+
+    # Very small synthetic instance
+    n = 2
+    coords = {
+        0: (0.0, 0.0),
+        1: (1.0, 0.0),
+        2: (0.0, 1.0),
+        3: (0.0, 0.0),
+    }
+    demands = {0: 0, 1: 10, 2: 20, 3: 0}
+    tw = {0: (0.0, 480.0), 1: (0.0, 200.0), 2: (0.0, 200.0), 3: (0.0, 480.0)}
+    D = {1, 2}
+    params = {
+        "problem_parameters": {"Q_t": 100, "Q_d": 20, "L_t": 480, "L_d": 30, "v_t_kmph": 40.0, "v_d_kmph": 40.0, "beta": 2.0},
+        "service_times": {"truck_service_time_minutes": 10.0, "drone_service_time_minutes": 5.0},
+        "cost_parameters": {"fixed_vehicle_cost_F": 20.0, "truck_cost_per_min_c_t": 0.083, "drone_cost_per_min_c_d": 0.021},
+    }
+    inst = Instance(id="demo", n=n, coords=coords, demands=demands, time_windows=tw, D=D, params=params)
+    dm = DistanceMatrix(inst)
+    dm.compute_all()
+    # Example route: truck goes 0 -> 1 -> 3; drone from 1 serves customer 2 and returns to 3
+    truck_seq = [0, 1, 3]
+    drone_sorties = [(1, [2], 3)]
+    route = Route(truck_seq=truck_seq, drone_sorties=drone_sorties, instance=inst, distances=dm, config=None)
+    feasible, reason = route.is_feasible()
+    print("Feasible:", feasible, "Reason:", reason)
+    if feasible:
+        col = route.to_column()
+        print("Column cost:", col.cost)
+        print("Column coverage:", [i for i, v in col.a_ir.items() if v == 1])
+        print("Serialized route:", json.dumps(route.serialize(), indent=2))
+

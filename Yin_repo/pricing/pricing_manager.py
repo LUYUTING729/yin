@@ -1,0 +1,622 @@
+## pricing/pricing_manager.py
+
+"""
+pricing/pricing_manager.py
+
+PricingManager orchestrates pricing subroutines to generate negative reduced-cost
+columns for the restricted master problem (RLMP). It follows the sequence
+described in the paper and the reproducibility plan:
+  greedy_deterministic -> greedy_randomized -> tabu_search -> dynamic_ng_route -> bounded_bidirectional_labeling
+
+This implementation is defensive and sets conservative defaults for configuration
+values that were left null in the provided config.yaml. It also logs structured
+events via the provided logger (if any).
+
+Public API:
+  class PricingManager:
+    def __init__(instance, distances, column_pool, config, logger=None, rng=None)
+    def generate_columns(duals, forbidden_arcs, forced_arcs, time_budget) -> List[Column]
+
+Notes:
+ - duals is expected to be a dict containing at least:
+     'pi': mapping customer_id -> float
+     'sigma': float (vehicle count dual, may be 0.0)
+     'zeta': optional mapping for SR duals (keys may be tuples/lists/strings)
+     'SR_sets': optional mapping index -> iterable of nodes (if 'zeta' uses integer keys)
+ - Returned columns are Column objects (from routes/route.Column) with attribute 'reduced_cost'
+   set when returned. Columns are added to the provided ColumnPool before being returned.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+import traceback
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import numpy as np
+
+# Project imports
+from instances.instance import Instance
+from geometry.distances import DistanceMatrix
+from columns.column_pool import ColumnPool
+from routes.route import Column, Route
+from pricing.heuristics import HeuristicPricing
+from pricing.labeler import Labeler
+from pricing.ng_route import NgRoutePricer
+
+# Optional logger import
+try:
+    from utils.logger import Logger  # type: ignore
+except Exception:
+    Logger = None  # type: ignore
+
+
+Arc = Tuple[int, int]
+
+
+class PricingManager:
+    """
+    Orchestrates pricing algorithms to generate negative reduced-cost columns.
+
+    Constructor args:
+      - instance: Instance
+      - distances: DistanceMatrix (compute_all() done)
+      - column_pool: ColumnPool (shared pool)
+      - config: dict-like configuration (from config.yaml). If keys missing, conservative defaults are used.
+      - logger: optional Logger instance
+      - rng: optional numpy.RandomState for reproducible heuristics
+
+    Important methods:
+      - generate_columns(duals, forbidden_arcs, forced_arcs, time_budget_seconds) -> List[Column]
+    """
+
+    def __init__(
+        self,
+        instance: Instance,
+        distances: DistanceMatrix,
+        column_pool: ColumnPool,
+        config: Optional[Dict[str, Any]] = None,
+        logger: Optional[Any] = None,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> None:
+        if instance is None or distances is None or column_pool is None:
+            raise ValueError("PricingManager requires non-null instance, distances and column_pool.")
+
+        self.instance = instance
+        self.distances = distances
+        self.column_pool = column_pool
+        self.config = dict(config or {})
+        self.logger = logger if logger is not None else (Logger(run_id="pricing_mgr", instance_id=getattr(instance, "id", None), config=self.config) if Logger is not None else None)
+        self.rng = rng if rng is not None else np.random.RandomState(self._extract_global_seed())
+
+        # Create heuristic pricer, labeler, ng_pricer
+        # HeuristicPricing expects config, column_pool, rng
+        try:
+            self.heuristics = HeuristicPricing(instance=self.instance, distances=self.distances, config=self.config, column_pool=self.column_pool, rng=self.rng)
+        except Exception as ex:
+            # HeuristicPricing may raise if cost params missing; propagate with context
+            raise RuntimeError(f"Failed to instantiate HeuristicPricing: {ex}")
+
+        # Labeler instantiated per call to allow setting per-call constraints if necessary.
+        # Still create a template labeler instance for reuse; some labeler implementations accept per-call constraints.
+        try:
+            self._labeler_template = Labeler(instance=self.instance, distances=self.distances, config=self.config, column_pool=self.column_pool, logger=self.logger)
+        except Exception:
+            # If Labeler cannot be instantiated (missing config keys), set to None and handle later
+            self._labeler_template = None
+
+        # Ng-route pricer requires a Labeler instance; create or reuse template
+        try:
+            # create NgRoutePricer with labeler template
+            self.ng_pricer = NgRoutePricer(instance=self.instance, distances=self.distances, labeler=self._labeler_template, column_pool=self.column_pool, config=self.config, logger=self.logger, rng=self.rng)
+        except Exception:
+            # If construction fails, set None and attempt to instantiate later on demand
+            self.ng_pricer = None
+
+        # Defaults for allocation and caps (conservative)
+        self.default_max_columns = int(self.config.get("column_generation", {}).get("sr_max_add_per_iteration") or self.config.get("pricing", {}).get("max_columns_returned") or 50)
+        # Sequence of pricing algorithms (paper default order)
+        self.pricing_sequence = list(self.config.get("pricing", {}).get("sequence") or ["greedy_deterministic", "greedy_randomized", "tabu_search", "dynamic_ng_route", "bounded_bidirectional_labeling"])
+        # whether to stop on first discovery (paper behavior default True)
+        self.stop_on_first = bool(self.config.get("pricing", {}).get("stop_on_first_discovery", True))
+        # Per-algorithm explicit time limits (optional): config.pricing.heuristic_time_limits mapping name->seconds
+        self.explicit_time_limits = dict(self.config.get("pricing", {}).get("heuristic_time_limits", {}) or {})
+        # Or fraction allocation mapping name->fraction (sums to 1). If absent, equal split used.
+        self.fraction_allocation = dict(self.config.get("pricing", {}).get("time_budget_allocation", {}) or {})
+
+        # reduced-cost epsilon from config (fallback to small value)
+        self.epsilon = float(self.config.get("column_generation", {}).get("sr_violation_eps", 1e-8))
+
+        # Ensure distances computed
+        if not getattr(self.distances, "_computed", False):
+            try:
+                self.distances.compute_all()
+            except Exception:
+                # let it raise to caller
+                raise
+
+        # Counters (for logging)
+        self.counter_calls = {"greedy_deterministic": 0, "greedy_randomized": 0, "tabu_search": 0, "dynamic_ng_route": 0, "bounded_bidirectional_labeling": 0}
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _extract_global_seed(self) -> int:
+        try:
+            repro = self.config.get("reproducibility", {}) or {}
+            seed = repro.get("global_random_seed")
+            if seed is None:
+                return 0
+            return int(seed)
+        except Exception:
+            return 0
+
+    def _log(self, event: str, payload: Dict[str, Any]) -> None:
+        if self.logger is not None:
+            try:
+                self.logger.log(event, payload)
+            except Exception:
+                # best-effort; do not raise
+                pass
+
+    @staticmethod
+    def _safe_get(obj: Dict[str, Any], *keys, default=None):
+        cur = obj
+        for k in keys:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(k, default)
+            if cur is default:
+                return default
+        return cur
+
+    def _compute_reduced_cost(self, col: Column, duals: Dict[str, Any]) -> float:
+        """
+        Compute reduced cost of a column given duals.
+
+        reduced_cost = c_r - sum_i a_ir * pi_i - sum_S (0.5 * (#nodes in S visited by route) * zeta_S) - sigma
+        """
+        # route cost
+        try:
+            c_r = float(col.cost)
+        except Exception:
+            # fallback to compute from route
+            try:
+                c_r = float(col.route.cost())
+            except Exception:
+                return float("inf")
+
+        # pi map
+        pi_raw = duals.get("pi", {}) or {}
+        pi_map = {}
+        for k, v in pi_raw.items():
+            try:
+                pi_map[int(k)] = float(v)
+            except Exception:
+                # skip malformed keys
+                continue
+
+        sigma = float(duals.get("sigma", 0.0))
+
+        # coverage
+        covered = {}
+        if hasattr(col, "a_ir") and isinstance(getattr(col, "a_ir"), dict):
+            # ensure integer keys
+            for ik, val in col.a_ir.items():
+                try:
+                    covered[int(ik)] = int(val)
+                except Exception:
+                    continue
+        else:
+            # fallback to route.covers()
+            try:
+                covset = col.route.covers()
+                for i in covset:
+                    covered[int(i)] = 1
+            except Exception:
+                covered = {}
+
+        sum_pi = 0.0
+        for i, val in covered.items():
+            if int(val) != 0:
+                sum_pi += float(pi_map.get(int(i), 0.0))
+
+        # SR zeta
+        zeta_raw = duals.get("zeta", {}) or {}
+        sr_sets = duals.get("SR_sets", {}) or {}
+        sr_term = 0.0
+        if isinstance(zeta_raw, dict) and zeta_raw:
+            for key, zval in zeta_raw.items():
+                nodes = None
+                if isinstance(key, int):
+                    # get nodes from sr_sets if provided
+                    nodes = sr_sets.get(key)
+                elif isinstance(key, (list, tuple)):
+                    nodes = tuple(int(x) for x in key)
+                elif isinstance(key, str):
+                    s = key.strip()
+                    if s.startswith("(") and s.endswith(")"):
+                        s = s[1:-1]
+                    parts = [p.strip() for p in s.split(",") if p.strip()]
+                    try:
+                        nodes = tuple(int(p) for p in parts)
+                    except Exception:
+                        nodes = None
+                if nodes is None:
+                    possible = sr_sets.get(key)
+                    if possible:
+                        try:
+                            nodes = tuple(int(x) for x in possible)
+                        except Exception:
+                            nodes = None
+                if nodes is None:
+                    # cannot parse nodes from this zeta entry
+                    continue
+                cnt = 0
+                for node in nodes:
+                    if int(node) in covered and int(covered[int(node)]) != 0:
+                        cnt += 1
+                if cnt > 0:
+                    sr_term += 0.5 * float(cnt) * float(zval)
+        # final reduced cost
+        rc = float(c_r) - float(sum_pi) - float(sr_term) - float(sigma)
+        return rc
+
+    def _fingerprint_column(self, col: Column) -> str:
+        """
+        Deterministic fingerprint for a Column to deduplicate returned columns.
+        Prefer route_id, else use serialization of route (truck_seq + sorties).
+        """
+        if hasattr(col, "route_id") and getattr(col, "route_id", None):
+            return str(col.route_id)
+        # try route.serialize()
+        try:
+            ser = col.route.serialize()
+            # create simple string representation
+            truck_seq = tuple(ser.get("truck_seq", []))
+            sorties = tuple(tuple((s["sep"], tuple(s.get("customers", [])), s["rendezvous"] if "rendezvous" in s else None)) for s in ser.get("drone_sorties", []))
+            return f"ts{truck_seq}_so{sorties}"
+        except Exception:
+            # fallback to cost+coverage
+            try:
+                cov = tuple(sorted(i for i, v in col.a_ir.items() if int(v) != 0))
+                return f"c{round(float(col.cost),4)}_cov{cov}"
+            except Exception:
+                return f"col_{id(col)}"
+
+    # -------------------------
+    # Main method
+    # -------------------------
+    def generate_columns(
+        self,
+        duals: Dict[str, Any],
+        forbidden_arcs: Optional[Set[Arc]] = None,
+        forced_arcs: Optional[Set[Arc]] = None,
+        time_budget: Optional[float] = None,
+    ) -> List[Column]:
+        """
+        Generate negative reduced-cost columns given duals and arc constraints.
+
+        Parameters:
+          - duals: dict with keys 'pi' (mapping), 'sigma' (float), optional 'zeta' and 'SR_sets'
+          - forbidden_arcs: set of (i,j) arcs not allowed
+          - forced_arcs: set of (i,j) arcs that must be present (may be empty)
+          - time_budget: total seconds allowed (recommended)
+
+        Returns:
+          - list of Column objects with reduced_cost < -epsilon (sorted ascending by reduced_cost).
+        """
+        start_time = time.time()
+        forbidden_arcs = set(forbidden_arcs or set())
+        forced_arcs = set(forced_arcs or set())
+        max_columns = int(self.config.get("column_generation", {}).get("sr_max_add_per_iteration") or self.default_max_columns)
+
+        # Validate duals minimally
+        if not isinstance(duals, dict) or "pi" not in duals:
+            raise ValueError("duals must be a dict containing at least 'pi' mapping. Received: %r" % (duals,))
+        # set default sigma if missing
+        if "sigma" not in duals:
+            duals = dict(duals)
+            duals["sigma"] = 0.0
+
+        # Determine per-algorithm budgets
+        total_time_budget = float(time_budget) if time_budget is not None else float(self.config.get("time_limits", {}).get("per_pricing_call_seconds") or self.config.get("time_limits", {}).get("per_pricing_call_seconds") or 60.0)
+        # If explicit time limits mapping present, use it; else if fraction allocation mapping present, derive per-algo budgets; else equal split.
+        per_algo_budget: Dict[str, float] = {}
+        explicit_limits = self.explicit_time_limits or {}
+        fraction_alloc = self.fraction_allocation or {}
+
+        if explicit_limits:
+            # use explicit limits but ensure keys match algorithms; if some missing, distribute leftover equally among missing
+            specified_sum = 0.0
+            for name, val in explicit_limits.items():
+                try:
+                    specified_sum += float(val)
+                except Exception:
+                    specified_sum += 0.0
+            # If specified_sum > total_time_budget, scale down proportionally
+            if specified_sum > 0.0:
+                scale = 1.0
+                if specified_sum > total_time_budget:
+                    scale = total_time_budget / specified_sum
+                for algo in self.pricing_sequence:
+                    if algo in explicit_limits:
+                        per_algo_budget[algo] = float(explicit_limits[algo]) * scale
+                    else:
+                        per_algo_budget[algo] = 0.0
+            else:
+                # no positive entries; fallback to equal split
+                equal = total_time_budget / max(1, len(self.pricing_sequence))
+                for algo in self.pricing_sequence:
+                    per_algo_budget[algo] = equal
+        elif fraction_alloc:
+            # validate fractions sum, else normalize
+            frac_sum = 0.0
+            for name, frac in fraction_alloc.items():
+                try:
+                    frac_sum += float(frac)
+                except Exception:
+                    frac_sum += 0.0
+            if frac_sum <= 0.0:
+                # fallback to equal split
+                equal = total_time_budget / max(1, len(self.pricing_sequence))
+                for algo in self.pricing_sequence:
+                    per_algo_budget[algo] = equal
+            else:
+                # normalize fractions and apply
+                for algo in self.pricing_sequence:
+                    frac = float(fraction_alloc.get(algo, 0.0))
+                    if frac <= 0.0:
+                        # if missing or zero, treat as zero; remaining fraction will be redistributed proportionally among non-zero entries
+                        per_algo_budget[algo] = 0.0
+                    else:
+                        per_algo_budget[algo] = total_time_budget * (frac / frac_sum)
+                # any zero-budget algorithms get small epsilon if all got zero; otherwise fine
+                if all(v <= 0.0 for v in per_algo_budget.values()):
+                    equal = total_time_budget / max(1, len(self.pricing_sequence))
+                    for algo in self.pricing_sequence:
+                        per_algo_budget[algo] = equal
+        else:
+            # default: equal split
+            equal = total_time_budget / max(1, len(self.pricing_sequence))
+            for algo in self.pricing_sequence:
+                per_algo_budget[algo] = equal
+
+        # Bookkeeping
+        columns_found: List[Column] = []
+        seen_fp: Set[str] = set()
+        counters = {k: 0 for k in self.pricing_sequence}
+        # Attempt sequence
+        for algo in self.pricing_sequence:
+            # check time remaining
+            elapsed = time.time() - start_time
+            remaining = total_time_budget - elapsed
+            if remaining <= 1e-9:
+                break
+            # assign allocated budget cannot exceed remaining
+            allocated = min(per_algo_budget.get(algo, 0.0), remaining)
+            if allocated <= 0.0:
+                # give a small epsilon budget to try quick heuristics
+                allocated = min(0.5, remaining)
+
+            # dispatch to method
+            try:
+                if algo == "greedy_deterministic":
+                    counters[algo] += 1
+                    # heuristics.greedy_deterministic signature only takes duals
+                    # Set constraints on heuristic instance
+                    self.heuristics.forbidden_arcs = forbidden_arcs
+                    self.heuristics.forced_arcs = forced_arcs
+                    start_a = time.time()
+                    candidates = self.heuristics.greedy_deterministic(duals)
+                    duration = time.time() - start_a
+                elif algo == "greedy_randomized":
+                    counters[algo] += 1
+                    self.heuristics.forbidden_arcs = forbidden_arcs
+                    self.heuristics.forced_arcs = forced_arcs
+                    # fetch repeats from config or default
+                    repeats = int(self._safe_get(self.config, "pricing", "heuristic_params", "greedy_random_restarts", default=20))
+                    start_a = time.time()
+                    candidates = self.heuristics.greedy_randomized(duals, repeats=repeats)
+                    duration = time.time() - start_a
+                elif algo == "tabu_search":
+                    counters[algo] += 1
+                    # seed routes: prefer columns in column_pool with reduced_cost around 0, else use previously found columns
+                    pool_cols = self.column_pool.get_all()
+                    zero_seed = []
+                    for pc in pool_cols:
+                        rc = getattr(pc, "reduced_cost", None)
+                        if rc is None:
+                            # try to compute approximate reduced cost; skip heavy computation here
+                            continue
+                        if abs(float(rc)) <= 1e-6:
+                            zero_seed.append(pc)
+                    seed_routes = [c.route for c in zero_seed] if zero_seed else [c.route for c in columns_found[:3] if hasattr(c, "route")]
+                    # fallback to empty list handled by heuristic
+                    self.heuristics.forbidden_arcs = forbidden_arcs
+                    self.heuristics.forced_arcs = forced_arcs
+                    start_a = time.time()
+                    candidates = self.heuristics.tabu_search(seed_routes, duals)
+                    duration = time.time() - start_a
+                elif algo == "dynamic_ng_route":
+                    counters[algo] += 1
+                    # ensure ng_pricer exists
+                    if self.ng_pricer is None:
+                        try:
+                            # try to reinstantiate
+                            self._labeler_template = Labeler(instance=self.instance, distances=self.distances, config=self.config, column_pool=self.column_pool, logger=self.logger)
+                            self.ng_pricer = NgRoutePricer(instance=self.instance, distances=self.distances, labeler=self._labeler_template, column_pool=self.column_pool, config=self.config, logger=self.logger, rng=self.rng)
+                        except Exception as ex:
+                            # cannot run ng-route
+                            self._log("pricing_ng_unavailable", {"error": str(ex)})
+                            candidates = []
+                            duration = 0.0
+                            # continue to next algo
+                            candidates = []
+                    # call ng_pricer.price with time limit and arc constraints
+                    start_a = time.time()
+                    # ng_pricer.price signature: price(duals, time_limit, forbidden_arcs=None, forced_arcs=None)
+                    candidates = self.ng_pricer.price(duals=duals, time_limit=allocated, forbidden_arcs=forbidden_arcs, forced_arcs=forced_arcs) if self.ng_pricer is not None else []
+                    duration = time.time() - start_a
+                elif algo in ("bounded_bidirectional_labeling", "labeler"):
+                    counters[algo] += 1
+                    # instantiate a fresh labeler with current constraints if needed
+                    if self._labeler_template is None:
+                        self._labeler_template = Labeler(instance=self.instance, distances=self.distances, config=self.config, column_pool=self.column_pool, logger=self.logger)
+                    labeler = self._labeler_template
+                    # some Labeler implementations accept forbidden/forced arcs as parameters to price; our Labeler.price signature supports them
+                    start_a = time.time()
+                    candidates = labeler.price(duals=duals, forbidden_arcs=forbidden_arcs, forced_arcs=forced_arcs, time_limit=allocated)
+                    duration = time.time() - start_a
+                else:
+                    # unknown algorithm: skip
+                    self._log("pricing_unknown_algo", {"algo": algo})
+                    candidates = []
+                    duration = 0.0
+            except Exception as ex:
+                # log and continue to next algorithm
+                self._log("pricing_algo_exception", {"algo": algo, "error": str(ex), "trace": traceback.format_exc()})
+                candidates = []
+                duration = 0.0
+
+            # post-process candidates: filter feasibility, forbidden/forced arcs, compute reduced cost, deduplicate
+            new_added = 0
+            for col in candidates or []:
+                # ensure Column object
+                if not isinstance(col, Column):
+                    # try to coerce minimal Column if possible
+                    try:
+                        # if col looks like a Route
+                        if isinstance(col, Route):
+                            col = col.to_column()
+                        else:
+                            continue
+                    except Exception:
+                        continue
+                # check forbidden arcs
+                violates = False
+                for arc in forbidden_arcs:
+                    try:
+                        if col.contains_arc(arc[0], arc[1]):
+                            violates = True
+                            break
+                    except Exception:
+                        # if contains_arc fails, fallback to checking route arcs
+                        try:
+                            t_arcs = set(col.truck_arcs) if hasattr(col, "truck_arcs") else set()
+                            d_arcs = set(col.drone_arcs) if hasattr(col, "drone_arcs") else set()
+                            if arc in t_arcs or arc in d_arcs:
+                                violates = True
+                                break
+                        except Exception:
+                            violates = True
+                            break
+                if violates:
+                    continue
+                # check forced arcs presence
+                missing_forced = False
+                for arc in forced_arcs:
+                    try:
+                        if not col.contains_arc(arc[0], arc[1]):
+                            missing_forced = True
+                            break
+                    except Exception:
+                        # fallback to route arcs
+                        try:
+                            t_arcs = set(col.truck_arcs) if hasattr(col, "truck_arcs") else set()
+                            d_arcs = set(col.drone_arcs) if hasattr(col, "drone_arcs") else set()
+                            if arc not in t_arcs and arc not in d_arcs:
+                                missing_forced = True
+                                break
+                        except Exception:
+                            missing_forced = True
+                            break
+                if missing_forced:
+                    continue
+
+                # ensure route feasibility
+                try:
+                    feasible, _reason = col.route.is_feasible()
+                except Exception:
+                    feasible = False
+                if not feasible:
+                    continue
+
+                # compute reduced cost if not provided
+                rc = getattr(col, "reduced_cost", None)
+                if rc is None:
+                    try:
+                        rc = self._compute_reduced_cost(col, duals)
+                        setattr(col, "reduced_cost", float(rc))
+                    except Exception:
+                        continue
+
+                # accept only strictly negative reduced cost beyond epsilon
+                if rc >= -self.epsilon:
+                    continue
+
+                # deduplicate
+                fp = self._fingerprint_column(col)
+                if fp in seen_fp:
+                    continue
+                seen_fp.add(fp)
+
+                # add to column_pool and local list
+                try:
+                    self.column_pool.add(col)
+                except Exception:
+                    # best-effort; continue
+                    pass
+                columns_found.append(col)
+                new_added += 1
+
+                # if we've reached max_columns stop
+                if len(columns_found) >= max_columns:
+                    break
+
+            # update counters and logs
+            elapsed_total = time.time() - start_time
+            self._log(
+                "pricing_algo_done",
+                {
+                    "algo": algo,
+                    "allocated_s": allocated,
+                    "duration_s": duration,
+                    "new_columns_added": new_added,
+                    "total_columns_found": len(columns_found),
+                    "elapsed_total_s": elapsed_total,
+                },
+            )
+
+            # stop further sequence if configured to stop on first discovery and we added at least one column
+            if self.stop_on_first and new_added > 0:
+                break
+
+            # check overall time budget
+            if (time.time() - start_time) >= total_time_budget - 1e-9:
+                break
+
+        # final sort by reduced cost (ascending) and cap
+        columns_found.sort(key=lambda c: float(getattr(c, "reduced_cost", float(c.cost))))
+        if len(columns_found) > max_columns:
+            columns_found = columns_found[:max_columns]
+
+        # structured logging summary
+        elapsed_total = time.time() - start_time
+        rc_list = [float(getattr(c, "reduced_cost", float(c.cost))) for c in columns_found[:10]]
+        self._log(
+            "pricing_call_summary",
+            {
+                "instance_id": getattr(self.instance, "id", None),
+                "time_budget_s": total_time_budget,
+                "time_used_s": elapsed_total,
+                "columns_returned": len(columns_found),
+                "top_reduced_costs": rc_list,
+                "forbidden_arcs_count": len(forbidden_arcs),
+                "forced_arcs_count": len(forced_arcs),
+                "counters": counters,
+            },
+        )
+
+        return columns_found
