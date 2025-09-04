@@ -1,0 +1,363 @@
+```python
+## geometry/distances.py
+
+"""
+DistanceMatrix for TD-DRPTW reproducibility project.
+
+This module provides the DistanceMatrix class which computes and caches:
+  - d_drone: Euclidean straight-line distances between nodes (in kilometers)
+  - d_truck: truck distances computed as beta * d_drone (in kilometers)
+  - t_drone: drone travel times between nodes (in minutes) including service time at arrival node
+  - t_truck: truck travel times between nodes (in minutes) including service time at arrival node
+
+Units:
+  - Coordinates supplied by Instance.coords are expected in kilometers (km).
+  - Speeds are expected in km/h (v_t_kmph, v_d_kmph).
+  - Travel times are returned in minutes.
+
+Key formulae:
+  - d_d(i,j) = sqrt((x_i - x_j)^2 + (y_i - y_j)^2)  [km]
+  - d_t(i,j) = beta * d_d(i,j)                       [km]
+  - t_d(i,j) = (d_d(i,j) / v_d_kmph) * 60 + service_time_drone(j) [min]
+  - t_t(i,j) = (d_t(i,j) / v_t_kmph) * 60 + service_time_truck(j) [min]
+    (for depot j (0 or n+1) service times are treated as 0)
+
+Important validations:
+  - Required numeric parameters must exist in instance.params:
+      instance.params should expose problem parameters and service times.
+    We attempt to read them from:
+      instance.params.get("problem_parameters", {}) and instance.params.get("service_times", {})
+    but also accept top-level keys in instance.params as fallback (for robustness).
+  - If any required parameter is missing or invalid (e.g., speed <= 0), DistanceMatrix.__init__
+    raises ValueError with a clear message explaining which config key to set.
+
+Notes:
+  - For drone-ineligible customers (customer j not in instance.D), t_drone(i,j) is set to numpy.inf
+    to indicate infeasibility of a drone serving that customer. Depots (0 and n+1) are always
+    permitted for drone/truck arrival (service time for depots is 0).
+  - Matrices are computed in compute_all() and cached as numpy.ndarray attributes.
+    Accessor methods (d_drone, d_truck, t_drone, t_truck) return Python floats (or numpy.inf)
+    and validate indices.
+  - The class is intentionally strict about required parameters: the implementer must
+    ensure instance.params contains the numeric experiment parameters before instantiating.
+
+Author: Reproducibility implementation
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+# For type hinting the Instance class without creating a hard circular import at runtime,
+# we use typing.TYPE_CHECKING. However imports here are safe because Instance is simple.
+from instances.instance import Instance  # as per project layout
+
+
+class DistanceMatrix:
+    """
+    DistanceMatrix encapsulates computation and lookup of distances and travel times.
+
+    Typical usage:
+        dm = DistanceMatrix(instance)
+        dm.compute_all()
+        d_km = dm.d_drone(0, 3)
+        t_min = dm.t_truck(2, 5)
+
+    Attributes created by compute_all():
+      - nodes: list[int] ordered node indices [0,1,...,n,n+1]
+      - node_index_map: dict[node_index -> row/col index in matrices]
+      - d_drone_mat: numpy.ndarray shape (N,N) distances (km)
+      - d_truck_mat: numpy.ndarray shape (N,N) distances (km)
+      - t_drone_mat: numpy.ndarray shape (N,N) times (minutes) including arrival service time; infeasible entries set to np.inf
+      - t_truck_mat: numpy.ndarray shape (N,N) times (minutes) including arrival service time
+      - service_time_truck: numpy.ndarray shape (N,) service times at node j in minutes (0 for depots)
+      - service_time_drone: numpy.ndarray shape (N,) service times at node j in minutes (0 for depots)
+    """
+
+    def __init__(self, instance: Instance) -> None:
+        """
+        Initialize DistanceMatrix with an Instance object. Validates required parameters
+        are present in instance.params but does not compute matrices until compute_all().
+
+        Raises:
+            ValueError: if required numeric parameters are missing or invalid.
+        """
+        if instance is None:
+            raise ValueError("DistanceMatrix: instance must be provided (got None).")
+
+        # Basic instance structural validation (lightweight)
+        self._instance = instance
+
+        # Build ordered nodes list and map nodes to indices; ensure expected ordering [0,1..n,n+1]
+        expected_nodes = list(range(0, self._instance.n + 2))
+        coords_keys = sorted(list(self._instance.coords.keys()))
+        if coords_keys != expected_nodes:
+            raise ValueError(
+                f"DistanceMatrix: instance.coords keys do not match expected node set [0..n+1]. "
+                f"Expected {expected_nodes}, got {coords_keys}."
+            )
+        self.nodes: List[int] = expected_nodes
+        self.node_index_map: Dict[int, int] = {node: idx for idx, node in enumerate(self.nodes)}
+        self.N: int = len(self.nodes)
+
+        # Extract parameters from instance.params robustly.
+        # Try nested under 'problem_parameters' or accept top-level presence in params.
+        params = self._instance.params or {}
+        problem_params = params.get("problem_parameters") if isinstance(params.get("problem_parameters"), dict) else {}
+        service_times = params.get("service_times") if isinstance(params.get("service_times"), dict) else {}
+
+        # Fallback to top-level entries if nested dicts absent (robustness)
+        def _get_param(name: str, fallback_group: dict, fallback_top: dict) -> Optional[float]:
+            # Try group first, then top-level
+            if name in fallback_group:
+                return fallback_group.get(name)
+            if name in fallback_top:
+                return fallback_top.get(name)
+            return None
+
+        self.v_t_kmph = _get_param("v_t_kmph", problem_params, params)
+        self.v_d_kmph = _get_param("v_d_kmph", problem_params, params)
+        self.beta = _get_param("beta", problem_params, params)
+
+        # Costs and F are not used here but present in params for other modules.
+        # service times lookup
+        self.truck_service_time_minutes = service_times.get("truck_service_time_minutes", None)
+        self.drone_service_time_minutes = service_times.get("drone_service_time_minutes", None)
+
+        # Validate presence and types
+        missing_fields = []
+        if self.v_t_kmph is None:
+            missing_fields.append("problem_parameters.v_t_kmph (truck speed km/h)")
+        if self.v_d_kmph is None:
+            missing_fields.append("problem_parameters.v_d_kmph (drone speed km/h)")
+        if self.beta is None:
+            missing_fields.append("problem_parameters.beta (truck/drone distance factor)")
+        if self.truck_service_time_minutes is None:
+            missing_fields.append("service_times.truck_service_time_minutes")
+        if self.drone_service_time_minutes is None:
+            missing_fields.append("service_times.drone_service_time_minutes")
+
+        if missing_fields:
+            # Provide explicit guidance to fix configuration
+            joined = ", ".join(missing_fields)
+            raise ValueError(
+                "DistanceMatrix: missing required configuration values in instance.params. "
+                "Please ensure the following keys are set (see config.yaml): "
+                f"{joined}."
+            )
+
+        # Validate numeric ranges
+        try:
+            self.v_t_kmph = float(self.v_t_kmph)
+            self.v_d_kmph = float(self.v_d_kmph)
+            self.beta = float(self.beta)
+            self.truck_service_time_minutes = float(self.truck_service_time_minutes)
+            self.drone_service_time_minutes = float(self.drone_service_time_minutes)
+        except Exception as ex:
+            raise ValueError(f"DistanceMatrix: failed to coerce numeric parameters to float: {ex}")
+
+        if not (self.v_t_kmph > 0.0):
+            raise ValueError("DistanceMatrix: problem_parameters.v_t_kmph must be > 0 (truck speed in km/h).")
+        if not (self.v_d_kmph > 0.0):
+            raise ValueError("DistanceMatrix: problem_parameters.v_d_kmph must be > 0 (drone speed in km/h).")
+        if not (self.beta >= 1.0):
+            raise ValueError("DistanceMatrix: problem_parameters.beta must be >= 1.0 as assumed in the paper.")
+        if not (self.truck_service_time_minutes >= 0.0):
+            raise ValueError("DistanceMatrix: service_times.truck_service_time_minutes must be >= 0.")
+        if not (self.drone_service_time_minutes >= 0.0):
+            raise ValueError("DistanceMatrix: service_times.drone_service_time_minutes must be >= 0.")
+
+        # Matrices will be computed on demand
+        self._computed: bool = False
+        self.d_drone_mat: Optional[np.ndarray] = None
+        self.d_truck_mat: Optional[np.ndarray] = None
+        self.t_drone_mat: Optional[np.ndarray] = None
+        self.t_truck_mat: Optional[np.ndarray] = None
+        self.service_time_truck: Optional[np.ndarray] = None
+        self.service_time_drone: Optional[np.ndarray] = None
+
+    # -----------------------------
+    # Public methods
+    # -----------------------------
+    def compute_all(self) -> None:
+        """
+        Compute and cache all distance and travel-time matrices.
+
+        After this call the following attributes are set:
+          - d_drone_mat, d_truck_mat (km)
+          - t_drone_mat, t_truck_mat (minutes)
+          - service_time_truck, service_time_drone (minutes per node)
+
+        This method is idempotent (recomputes and overwrites if called again).
+        """
+        # Build coordinates array in node order
+        coords_arr = np.zeros((self.N, 2), dtype=np.float64)
+        for node_idx, node in enumerate(self.nodes):
+            x, y = self._instance.coords[node]
+            coords_arr[node_idx, 0] = float(x)
+            coords_arr[node_idx, 1] = float(y)
+
+        # Compute pairwise Euclidean distances (drone distances) (km)
+        # Use vectorized broadcasting for efficiency
+        diff = coords_arr[:, None, :] - coords_arr[None, :, :]  # shape (N, N, 2)
+        dist2 = np.sum(diff * diff, axis=2)
+        # Ensure numerical non-negativity
+        dist2[dist2 < 0.0] = 0.0
+        d_drone = np.sqrt(dist2, dtype=np.float64)
+
+        # Truck distances: beta * drone distances
+        d_truck = self.beta * d_drone
+
+        # Convert distances to travel times (minutes) using speeds
+        # travel_time_minutes = (distance_km / speed_kmph) * 60.0
+        if self.v_d_kmph <= 0.0 or self.v_t_kmph <= 0.0:
+            raise ValueError("DistanceMatrix: speeds must be positive (v_d_kmph, v_t_kmph).")
+
+        t_drone_travel = (d_drone / float(self.v_d_kmph)) * 60.0
+        t_truck_travel = (d_truck / float(self.v_t_kmph)) * 60.0
+
+        # Build service time arrays per node (minutes). Depots (0 and n+1) use 0 service time.
+        service_truck = np.zeros((self.N,), dtype=np.float64)
+        service_drone = np.zeros((self.N,), dtype=np.float64)
+        # nodes list corresponds to indices in arrays; map service times to customer nodes 1..n only
+        for node_idx, node in enumerate(self.nodes):
+            if node == 0 or node == self._instance.n + 1:
+                service_truck[node_idx] = 0.0
+                service_drone[node_idx] = 0.0
+            else:
+                service_truck[node_idx] = float(self.truck_service_time_minutes)
+                service_drone[node_idx] = float(self.drone_service_time_minutes)
+
+        # Add service time at arrival node j to travel time matrices:
+        # t[i, j] = travel_component[i, j] + service_time[j]
+        # Use broadcasting to add service times along columns
+        t_drone = t_drone_travel + service_drone[None, :]
+        t_truck = t_truck_travel + service_truck[None, :]
+
+        # For drone-ineligible customers j (j not in instance.D) set t_drone[:, j] = inf for customer nodes only.
+        # Depots are permitted (indices 0 and n+1).
+        # Identify customer node indices (in nodes order) that are NOT in D
+        D_set = set(self._instance.D or set())
+        # Build a boolean mask for customer nodes
+        ineligible_mask = np.zeros((self.N,), dtype=bool)
+        for node_idx, node in enumerate(self.nodes):
+            if 1 <= node <= self._instance.n:  # customer node
+                if node not in D_set:
+                    ineligible_mask[node_idx] = True
+            else:
+                ineligible_mask[node_idx] = False
+
+        if np.any(ineligible_mask):
+            # set entire column j (arrival at j) to inf where j ineligible
+            # keep depots unaffected because ineligible_mask is False for depots
+            cols = np.where(ineligible_mask)[0]
+            # assign inf in place
+            for c in cols:
+                t_drone[:, c] = np.inf
+
+        # Cache matrices and arrays
+        self.d_drone_mat = d_drone
+        self.d_truck_mat = d_truck
+        self.t_drone_mat = t_drone
+        self.t_truck_mat = t_truck
+        self.service_time_truck = service_truck
+        self.service_time_drone = service_drone
+        self._computed = True
+
+    def d_drone(self, i: int, j: int) -> float:
+        """
+        Return Euclidean distance (km) between nodes i and j.
+
+        Raises IndexError if node indices invalid.
+        """
+        if not self._computed:
+            self.compute_all()
+        if i not in self.node_index_map or j not in self.node_index_map:
+            raise IndexError(f"DistanceMatrix.d_drone: invalid node indices i={i}, j={j}")
+        vi = self.node_index_map[i]
+        vj = self.node_index_map[j]
+        # Cast to Python float to avoid exposing numpy types
+        return float(self.d_drone_mat[vi, vj])
+
+    def d_truck(self, i: int, j: int) -> float:
+        """
+        Return truck distance (km) between nodes i and j (beta-scaled).
+
+        Raises IndexError if node indices invalid.
+        """
+        if not self._computed:
+            self.compute_all()
+        if i not in self.node_index_map or j not in self.node_index_map:
+            raise IndexError(f"DistanceMatrix.d_truck: invalid node indices i={i}, j={j}")
+        vi = self.node_index_map[i]
+        vj = self.node_index_map[j]
+        return float(self.d_truck_mat[vi, vj])
+
+    def t_drone(self, i: int, j: int) -> float:
+        """
+        Return drone travel time (minutes) from node i to node j including arrival service time.
+
+        If j is a customer and not drone-eligible, returns numpy.inf to indicate infeasibility.
+
+        Raises IndexError if node indices invalid.
+        """
+        if not self._computed:
+            self.compute_all()
+        if i not in self.node_index_map or j not in self.node_index_map:
+            raise IndexError(f"DistanceMatrix.t_drone: invalid node indices i={i}, j={j}")
+        vi = self.node_index_map[i]
+        vj = self.node_index_map[j]
+        val = self.t_drone_mat[vi, vj]
+        # Cast np.inf or numpy float to Python float (np.inf remains float('inf'))
+        return float(val)
+
+    def t_truck(self, i: int, j: int) -> float:
+        """
+        Return truck travel time (minutes) from node i to node j including arrival service time.
+
+        Raises IndexError if node indices invalid.
+        """
+        if not self._computed:
+            self.compute_all()
+        if i not in self.node_index_map or j not in self.node_index_map:
+            raise IndexError(f"DistanceMatrix.t_truck: invalid node indices i={i}, j={j}")
+        vi = self.node_index_map[i]
+        vj = self.node_index_map[j]
+        return float(self.t_truck_mat[vi, vj])
+
+    # -----------------------------
+    # Utility static method
+    # -----------------------------
+    @staticmethod
+    def convert_km_to_minutes(distance_km: float, speed_kmph: float) -> float:
+        """
+        Convert distance in kilometers and speed in km/h to minutes.
+
+        Returns:
+            minutes as float
+
+        Raises:
+            ValueError if speed_kmph <= 0
+        """
+        if speed_kmph <= 0.0:
+            raise ValueError("convert_km_to_minutes: speed_kmph must be > 0")
+        return float((float(distance_km) / float(speed_kmph)) * 60.0)
+
+    # -----------------------------
+    # Diagnostics / representation
+    # -----------------------------
+    def __repr__(self) -> str:
+        if self._computed:
+            return (
+                f"<DistanceMatrix nodes={self.N} (0..{self._instance.n + 1}), "
+                f"v_t={self.v_t_kmph} km/h, v_d={self.v_d_kmph} km/h, beta={self.beta}>"
+            )
+        else:
+            return (
+                f"<DistanceMatrix (not computed) nodes={self.N} (0..{self._instance.n + 1}), "
+                f"v_t={self.v_t_kmph} km/h, v_d={self.v_d_kmph} km/h, beta={self.beta}>"
+            )
+```

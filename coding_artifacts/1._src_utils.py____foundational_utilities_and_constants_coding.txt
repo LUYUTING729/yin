@@ -1,0 +1,397 @@
+```python
+## 1. src/utils.py  # foundational utilities and constants
+
+"""
+Utilities used across the Branch-and-Price-and-Cut implementation.
+
+This module provides:
+- RNG seeding for reproducibility: set_seed(seed: int) -> None
+- Unit conversions: kmh_to_kmpm(v_kmh: float) -> float
+- Travel time helper: travel_time_km(distance_km: float, speed_kmh: float) -> float
+- Geometry helper: euclidean(p1, p2) -> float
+- Numeric tolerance constant EPS (default 1e-9) and EPS-aware comparison helpers:
+    approx_equal, leq, geq, lt, gt
+- A simple timing decorator factory: timeit(label: str) -> Callable
+- Small numeric helpers: safe_divide, format_seconds
+
+Important reproducibility note:
+- This module does NOT parse or read config.yaml on import. The project's entry point
+  (Main or Config) must set:
+    utils.EPS = float(config['pricing_and_cutting']['labelling']['eps'])
+  and must call:
+    utils.set_seed(int(config['randomness_and_reproducibility']['seed']))
+  to ensure consistent numeric tolerances and RNG seeding across runs.
+
+Author: Reproduction code (adapted from paper design)
+"""
+
+from __future__ import annotations
+
+import math
+import time
+import logging
+import random
+import os
+import warnings
+from functools import wraps
+from typing import Callable, Tuple, Optional, Any
+
+import numpy as np  # numpy is used for RNG and possible vector operations
+
+# Public API exported names
+__all__ = [
+    "set_seed",
+    "kmh_to_kmpm",
+    "travel_time_km",
+    "euclidean",
+    "EPS",
+    "approx_equal",
+    "leq",
+    "geq",
+    "lt",
+    "gt",
+    "timeit",
+    "safe_divide",
+    "format_seconds",
+]
+
+# Module-level logger
+_logger = logging.getLogger(__name__)
+if not _logger.handlers:
+    # Ensure there's at least a default handler to avoid "No handler" warnings.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
+    _logger.addHandler(_handler)
+_logger.setLevel(logging.INFO)
+
+
+# Default floating point tolerance. Main program should override with config value.
+EPS: float = 1e-9
+
+
+def set_seed(seed: Optional[int]) -> None:
+    """
+    Set RNG seeds for reproducibility.
+
+    This function seeds the Python `random` module and numpy's legacy RNG
+    (numpy.random.seed). It does not configure solver-specific RNGs (CPLEX/Gurobi)
+    which must be set using solver parameters in solver wrappers.
+
+    Parameters
+    ----------
+    seed : int
+        Integer seed to set. Must not be None.
+
+    Raises
+    ------
+    ValueError
+        If seed is None.
+    TypeError
+        If seed cannot be cast to an integer.
+    """
+    if seed is None:
+        raise ValueError("seed must be provided to set_seed for reproducibility")
+
+    try:
+        seed_int = int(seed)
+    except Exception as exc:
+        raise TypeError(f"seed must be an integer-castable value; got {seed!r}") from exc
+
+    # Set Python RNG
+    random.seed(seed_int)
+    # Set numpy legacy RNG (affects numpy.random.* convenience functions)
+    np.random.seed(seed_int)
+
+    # Recommend using numpy.random.SeedSequence to spawn reproducible sub-seeds for parallel jobs.
+    # Do not attempt to reset PYTHONHASHSEED here (requires process restart to be fully effective).
+    # But set the env var to document intent.
+    os.environ.setdefault("PYTHONHASHSEED", str(seed_int))
+
+    _logger.info("Random seeds set (python random + numpy.random). PYTHONHASHSEED=%s", os.environ.get("PYTHONHASHSEED"))
+
+
+def kmh_to_kmpm(v_kmh: float) -> float:
+    """
+    Convert speed from kilometers per hour (km/h) to kilometers per minute (km/min).
+
+    Parameters
+    ----------
+    v_kmh : float
+        Speed in km/h. Must be positive.
+
+    Returns
+    -------
+    float
+        Speed in km/min.
+
+    Raises
+    ------
+    ValueError
+        If v_kmh is not positive.
+    """
+    if not isinstance(v_kmh, (int, float)):
+        raise TypeError("v_kmh must be a numeric type (int or float)")
+    if v_kmh <= 0.0:
+        raise ValueError("v_kmh must be positive")
+    return float(v_kmh) / 60.0
+
+
+def travel_time_km(distance_km: float, speed_kmh: float) -> float:
+    """
+    Compute travel time (in minutes) for a given distance (km) and speed (km/h).
+
+    Parameters
+    ----------
+    distance_km : float
+        Distance in kilometers (must be >= 0).
+    speed_kmh : float
+        Speed in kilometers per hour (must be > 0).
+
+    Returns
+    -------
+    float
+        Travel time in minutes.
+
+    Raises
+    ------
+    ValueError
+        If distance_km < 0 or speed_kmh <= 0.
+    """
+    if not isinstance(distance_km, (int, float)):
+        raise TypeError("distance_km must be numeric")
+    if distance_km < 0.0:
+        raise ValueError("distance_km must be non-negative")
+    if not isinstance(speed_kmh, (int, float)):
+        raise TypeError("speed_kmh must be numeric")
+    if speed_kmh <= 0.0:
+        raise ValueError("speed_kmh must be positive")
+    # travel time in minutes = distance_km / (speed_kmh / 60) = (distance_km * 60) / speed_kmh
+    return float(distance_km) * 60.0 / float(speed_kmh)
+
+
+def euclidean(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    """
+    Compute Euclidean distance between two 2D points.
+
+    Parameters
+    ----------
+    p1 : (float, float)
+        First point as (x, y).
+    p2 : (float, float)
+        Second point as (x, y).
+
+    Returns
+    -------
+    float
+        Euclidean distance.
+
+    Raises
+    ------
+    TypeError
+        If inputs are not sequences of two numeric elements.
+    """
+    try:
+        x1, y1 = p1
+        x2, y2 = p2
+    except Exception as exc:
+        raise TypeError("p1 and p2 must be sequences of two numeric values (x, y)") from exc
+
+    if not (isinstance(x1, (int, float)) and isinstance(y1, (int, float)) and
+            isinstance(x2, (int, float)) and isinstance(y2, (int, float))):
+        raise TypeError("coordinates must be numeric")
+
+    # math.hypot is numerically stable and fast
+    return math.hypot(float(x1) - float(x2), float(y1) - float(y2))
+
+
+# Numeric comparison helpers using EPS tolerance
+def _get_eps(eps: Optional[float]) -> float:
+    return float(EPS if eps is None else eps)
+
+
+def approx_equal(a: float, b: float, eps: Optional[float] = None) -> bool:
+    """
+    Return True if a and b are approximately equal within tolerance eps.
+
+    Equivalent to: abs(a - b) <= eps
+    """
+    eps_val = _get_eps(eps)
+    try:
+        return abs(float(a) - float(b)) <= eps_val
+    except Exception:
+        return False
+
+
+def leq(a: float, b: float, eps: Optional[float] = None) -> bool:
+    """
+    Return True if a <= b + eps (with tolerance).
+    """
+    eps_val = _get_eps(eps)
+    return float(a) <= float(b) + eps_val
+
+
+def geq(a: float, b: float, eps: Optional[float] = None) -> bool:
+    """
+    Return True if a >= b - eps (with tolerance).
+    """
+    eps_val = _get_eps(eps)
+    return float(a) >= float(b) - eps_val
+
+
+def lt(a: float, b: float, eps: Optional[float] = None) -> bool:
+    """
+    Return True if a < b - eps (strictly less with tolerance).
+    """
+    eps_val = _get_eps(eps)
+    return float(a) < float(b) - eps_val
+
+
+def gt(a: float, b: float, eps: Optional[float] = None) -> bool:
+    """
+    Return True if a > b + eps (strictly greater with tolerance).
+    """
+    eps_val = _get_eps(eps)
+    return float(a) > float(b) + eps_val
+
+
+def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """
+    Safely divide numerator by denominator. If denominator is close to zero
+    (|denominator| <= EPS) returns `default` instead of raising an error.
+
+    Parameters
+    ----------
+    numerator : float
+    denominator : float
+    default : float
+        Value to return when denominator is zero or nearly zero.
+
+    Returns
+    -------
+    float
+    """
+    try:
+        if abs(float(denominator)) <= EPS:
+            return float(default)
+        return float(numerator) / float(denominator)
+    except Exception:
+        return float(default)
+
+
+def format_seconds(seconds: float) -> str:
+    """
+    Format a duration in seconds into a human-readable string: Hh Mm Ss.sss
+
+    Examples
+    --------
+    >>> format_seconds(3661.234)
+    '1h 1m 1.234s'
+    """
+    try:
+        total = float(seconds)
+    except Exception:
+        return str(seconds)
+    if total < 0:
+        total = -total
+        neg = True
+    else:
+        neg = False
+
+    hrs = int(total // 3600)
+    mins = int((total % 3600) // 60)
+    secs = total % 60.0
+    parts = []
+    if hrs:
+        parts.append(f"{hrs}h")
+    if mins or hrs:
+        parts.append(f"{mins}m")
+    parts.append(f"{secs:.3f}s")
+    out = " ".join(parts)
+    return "-" + out if neg else out
+
+
+def timeit(label: Optional[str] = None) -> Callable:
+    """
+    Decorator factory to time function execution and log the elapsed time.
+
+    Usage:
+        @timeit("pricing.greedy")
+        def greedy(...):
+            ...
+
+    The decorator logs a DEBUG-level message formatted as:
+        [TIMING] <label or func_name>: <elapsed_seconds>s
+
+    Parameters
+    ----------
+    label : Optional[str]
+        A label to use in logging. If None, the wrapped function's __name__ is used.
+
+    Returns
+    -------
+    Callable
+        A decorator which wraps a function and logs its execution time.
+    """
+    def decorator(func: Callable) -> Callable:
+        func_label = label or func.__name__
+
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                end = time.perf_counter()
+                elapsed = end - start
+                # Log at DEBUG; higher-level code can configure log level as desired.
+                _logger.debug("[TIMING] %s: %.6fs", func_label, elapsed)
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+# Basic sanity unit-test helpers when run as script (not a substitute for pytest tests)
+if __name__ == "__main__":
+    # Quick smoke tests for functions in this module.
+    logging.getLogger(__name__).setLevel(logging.DEBUG)
+    _logger.info("Running quick self-checks for utils module...")
+
+    # set_seed reproducibility
+    set_seed(12345)
+    a1 = np.random.rand(5).tolist()
+    set_seed(12345)
+    a2 = np.random.rand(5).tolist()
+    assert a1 == a2, "numpy RNG reproducibility check failed"
+
+    # kmh <-> kmpm
+    assert kmh_to_kmpm(60.0) == 1.0
+    assert abs(travel_time_km(10.0, 60.0) - 10.0) < 1e-12
+
+    # euclidean
+    assert abs(euclidean((0, 0), (3, 4)) - 5.0) < 1e-12
+
+    # EPS comparisons
+    old_eps = EPS
+    try:
+        # temporarily set EPS larger
+        EPS = 1e-6
+        assert approx_equal(1.0 + 1e-7, 1.0)
+        assert leq(1.0, 1.0 + 1e-7)
+        assert geq(1.0 + 1e-7, 1.0)
+        assert not lt(1.0, 1.0 + 1e-7)  # since eps=1e-6, 1e-7 is not significant
+    finally:
+        EPS = old_eps
+
+    # timeit decorator quick check
+    @timeit("utils.sleep_test")
+    def _sleep_test():
+        time.sleep(0.01)
+        return "ok"
+
+    res = _sleep_test()
+    assert res == "ok"
+
+    _logger.info("utils module quick checks passed.")
+```

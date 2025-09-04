@@ -1,0 +1,1033 @@
+```python
+## pricing/heuristics.py
+
+"""
+pricing/heuristics.py
+
+Heuristic pricing algorithms for the TD-DRPTW reproduction project.
+
+Implements the HeuristicPricing class with three heuristics used by the
+PricingManager:
+  - greedy_deterministic(duals) -> List[Column]
+  - greedy_randomized(duals, repeats) -> List[Column]
+  - tabu_search(seed_routes, duals) -> List[Column]
+
+Important design constraints (do NOT invent defaults for required hyperparameters):
+ - If a heuristic requires specific config entries (e.g., greedy_random_top_k,
+   greedy_random_restarts, tabu_tenure), and they are missing/None in the provided
+   config (config dict loaded from config.yaml), the heuristic will raise ValueError
+   describing the missing keys. This follows the reproducibility plan: do not
+   fabricate unspecified defaults.
+
+ - Service times must be available via instance.params['service_times'] or via
+   config['service_times']; heuristics will raise an error if service times are
+   absent because travel-times computations and feasibility checks depend on them.
+
+Interfaces adhere to the project's design:
+ - HeuristicPricing.__init__(instance, distances, config, column_pool, rng)
+ - Methods accept duals as produced by RLMP_Solver.solve_lp(): duals['pi'], optional duals['sigma'],
+   optional duals['zeta'] mapping (keys are tuples of ints representing S).
+
+Notes:
+ - This file intentionally keeps algorithms conservative and readable rather than
+   extremely optimized. It performs necessary feasibility checks using Route.is_feasible()
+   for final candidate acceptance; quick filters are applied to reduce expensive checks.
+ - The ColumnPool passed is used to deduplicate and persist candidate columns.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import time
+import logging
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import numpy as np
+
+# Project imports (assume modules are in package path)
+from instances.instance import Instance
+from geometry.distances import DistanceMatrix
+from routes.route import Route, Column
+from columns.column_pool import ColumnPool
+
+# Setup module logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    # If no handler configured by outer application, add a NullHandler to avoid noisy logs.
+    logger.addHandler(logging.NullHandler())
+
+
+# Type aliases
+Node = int
+Arc = Tuple[int, int]
+Duals = Dict[str, Any]
+
+
+class HeuristicPricing:
+    """
+    HeuristicPricing implements deterministic greedy, randomized greedy, and tabu search
+    heuristics for the pricing problem.
+
+    Constructor parameters:
+      - instance: Instance
+      - distances: DistanceMatrix (compute_all() should already have been called)
+      - config: dict-like configuration loaded from config.yaml (or Config proxy). The module
+                accesses nested keys under 'pricing' and 'cost_parameters' and 'service_times'.
+      - column_pool: ColumnPool for deduplication/persistence (thread-safe)
+      - rng: numpy.random.RandomState (for reproducibility). The caller (PricingManager)
+             is responsible for providing a reproducible RNG.
+
+    Public attributes:
+      - forbidden_arcs: Set[Tuple[int,int]] arcs that must not appear in candidate routes
+      - forced_arcs: Set[Tuple[int,int]] arcs that must appear in candidate routes (if non-empty,
+                     any returned column must contain all forced arcs)
+
+    Public methods:
+      - greedy_deterministic(duals) -> List[Column]
+      - greedy_randomized(duals, repeats) -> List[Column]
+      - tabu_search(seed_routes, duals) -> List[Column]
+    """
+
+    def __init__(
+        self,
+        instance: Instance,
+        distances: DistanceMatrix,
+        config: Optional[Dict[str, Any]],
+        column_pool: ColumnPool,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> None:
+        if instance is None or distances is None or column_pool is None:
+            raise ValueError("HeuristicPricing requires instance, distances, and column_pool (non-null).")
+
+        self.instance = instance
+        self.distances = distances
+        self.config = dict(config or {})
+        self.column_pool = column_pool
+        self.rng = rng if rng is not None else np.random.RandomState(0)
+
+        # Forbidden / forced arc sets (can be set externally by PricingManager before calls)
+        self.forbidden_arcs: Set[Arc] = set()
+        self.forced_arcs: Set[Arc] = set()
+
+        # Pull cost parameters robustly (either from config or instance.params)
+        self._load_cost_parameters()
+
+        # Validate service times available (DistanceMatrix also requires them)
+        self._validate_service_times_present()
+
+        # small performance constants
+        self._max_candidate_drone_sortie_size_key = "max_drone_sortie_customers"
+
+    # -------------------
+    # Initialization helpers
+    # -------------------
+    def _get_config_value(self, *keys: str, default: Any = None) -> Any:
+        """
+        Safely fetch nested configuration values. Keys are applied hierarchically.
+        Example: _get_config_value('pricing', 'heuristic_params', 'greedy_random_top_k')
+        """
+        cur = self.config
+        for key in keys:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(key, default)
+            if cur is default:
+                return default
+        return cur
+
+    def _load_cost_parameters(self) -> None:
+        """Extract c_t, c_d, F from config or instance.params; raise if missing."""
+        # Try config top-level cost_parameters
+        cost_cfg = self.config.get("cost_parameters") if isinstance(self.config.get("cost_parameters"), dict) else {}
+        inst_costs = self.instance.params.get("cost_parameters") if isinstance(self.instance.params, dict) else {}
+
+        def _fetch(name: str) -> Optional[float]:
+            if name in cost_cfg:
+                return float(cost_cfg[name])
+            if name in inst_costs:
+                return float(inst_costs[name])
+            # also check top-level config keys for backward compatibility
+            if name in self.config:
+                return float(self.config[name])
+            return None
+
+        c_t = _fetch("truck_cost_per_min_c_t")
+        c_d = _fetch("drone_cost_per_min_c_d")
+        F = _fetch("fixed_vehicle_cost_F")
+
+        missing = []
+        if c_t is None:
+            missing.append("cost_parameters.truck_cost_per_min_c_t")
+        if c_d is None:
+            missing.append("cost_parameters.drone_cost_per_min_c_d")
+        if F is None:
+            missing.append("cost_parameters.fixed_vehicle_cost_F")
+        if missing:
+            raise ValueError(f"HeuristicPricing requires cost parameters but missing: {missing}. Please set them in config.yaml under 'cost_parameters'.")
+
+        self.c_t = float(c_t)
+        self.c_d = float(c_d)
+        self.F = float(F)
+
+    def _validate_service_times_present(self) -> None:
+        """
+        Ensure service times are provided either in config or instance.params.
+        The DistanceMatrix implementation also requires these; heuristics rely on distances.
+        """
+        # Check instance.params['service_times'] first then config['service_times']
+        st = {}
+        if isinstance(self.instance.params, dict):
+            st = self.instance.params.get("service_times") or {}
+        if not st:
+            st = self.config.get("service_times") or {}
+
+        truck_st = st.get("truck_service_time_minutes")
+        drone_st = st.get("drone_service_time_minutes")
+        if truck_st is None or drone_st is None:
+            raise ValueError(
+                "Service times must be provided for both truck and drone (config.service_times.truck_service_time_minutes and "
+                "config.service_times.drone_service_time_minutes or in instance.params['service_times'])."
+            )
+        # no need to store here; DistanceMatrix already used them
+
+    # -------------------
+    # Duals helpers
+    # -------------------
+    def _validate_and_extract_duals(self, duals: Duals) -> Tuple[Dict[int, float], float, Dict[Tuple[int, ...], float]]:
+        """
+        Validate expected dual keys and return canonical structures:
+          - pi_map: dict customer_id -> float (must be present)
+          - sigma: float (vehicle-count dual) default 0.0 if absent
+          - zeta: dict where keys are tuple(sorted(S)) -> dual value (may be empty dict)
+
+        Raises ValueError on missing critical duals (pi_map).
+        """
+        if not isinstance(duals, dict):
+            raise ValueError("duals must be a dict as returned by RLMP_Solver.solve_lp().")
+
+        # Extract pi mapping (customers). Accept several possible shapes but require mapping of ints.
+        pi_map = duals.get("pi")
+        if pi_map is None:
+            # maybe provided as 'pi_i' or per-customer keys; we require 'pi' per design
+            raise ValueError("duals must contain 'pi' mapping for customers (pi_i).")
+        # ensure int keys
+        canonical_pi: Dict[int, float] = {}
+        for k, v in pi_map.items():
+            try:
+                ik = int(k)
+                canonical_pi[ik] = float(v)
+            except Exception:
+                # try parse string key like "1"
+                try:
+                    ik = int(str(k))
+                    canonical_pi[ik] = float(v)
+                except Exception:
+                    raise ValueError(f"duals['pi'] contains non-integer key: {k}")
+
+        sigma = float(duals.get("sigma", 0.0))
+        # zeta mapping: keys may be tuples or stringified; normalize to tuple(sorted(S))
+        zeta_raw = duals.get("zeta", {}) or {}
+        canonical_zeta: Dict[Tuple[int, ...], float] = {}
+        for key, val in zeta_raw.items():
+            if isinstance(key, (list, tuple)):
+                sk = tuple(int(x) for x in sorted(list(key)))
+                canonical_zeta[sk] = float(val)
+            elif isinstance(key, str):
+                # attempt to parse "1,2,3" or "(1,2,3)"
+                s = key.strip()
+                s = s.strip("()[] ")
+                if s == "":
+                    continue
+                parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+                try:
+                    nums = tuple(sorted(int(p) for p in parts))
+                    canonical_zeta[nums] = float(val)
+                except Exception:
+                    # ignore malformed key
+                    continue
+            else:
+                # try to coerce single int into tuple
+                try:
+                    ik = int(key)
+                    canonical_zeta[(ik,)] = float(val)
+                except Exception:
+                    continue
+
+        return canonical_pi, sigma, canonical_zeta
+
+    def _compute_pi_depot(self, duals: Duals) -> float:
+        """
+        Compute pi for depots (pi_0 = pi_{n+1}) if not explicitly provided by duals.
+        Paper indicates pi_0 = pi_{n+1} = (F - sigma) / 2.
+        """
+        # If duals provides entries for depot 0 or n+1 in duals['pi'], use them (rare)
+        pi_map = duals.get("pi", {}) if isinstance(duals, dict) else {}
+        if 0 in pi_map:
+            return float(pi_map[0])
+        if (self.instance.n + 1) in pi_map:
+            return float(pi_map[self.instance.n + 1])
+        sigma = float(duals.get("sigma", 0.0))
+        # Use F from cost params
+        return float((self.F - sigma) / 2.0)
+
+    def _compute_reduced_cost_for_route(self, route: Route, duals: Duals) -> float:
+        """
+        Compute exact reduced cost for a complete synthetic-route Route using duals.
+
+        reduced_cost = c_r - sum_i a_ir * pi_i - sum_S ( (1/2)*(sum_{i in S} a_ir) * zeta_S ) - sigma
+
+        Route.cost() returns full c_r including fixed vehicle cost F per our Route.cost implementation,
+        but in the paper the reduced cost formula includes +F - sigma etc. Our Route.cost includes F,
+        so formula applies directly.
+        """
+        # Validate duals
+        pi_map, sigma, zeta_map = self._validate_and_extract_duals(duals)
+        # compute route cost (may return inf if infeasible travel)
+        try:
+            c_r = float(route.cost())
+        except Exception as ex:
+            # If route.cost() fails, return +inf so candidate is ignored
+            logger.debug("route.cost() error: %s", ex)
+            return float("inf")
+
+        # coverage a_ir
+        try:
+            covered = route.covers()
+        except Exception:
+            # if covers computation fails, fallback to empty set
+            covered = set()
+
+        # sum pi over covered customers
+        sum_pi = 0.0
+        for i in covered:
+            sum_pi += float(pi_map.get(int(i), 0.0))
+
+        # SR contributions
+        sr_term = 0.0
+        if zeta_map:
+            for S_tuple, zval in zeta_map.items():
+                # count how many nodes from S are covered by route
+                cnt = 0
+                for node in S_tuple:
+                    if int(node) in covered:
+                        cnt += 1
+                if cnt > 0:
+                    sr_term += 0.5 * float(cnt) * float(zval)
+
+        reduced_cost = float(c_r) - float(sum_pi) - float(sr_term) - float(sigma)
+        return reduced_cost
+
+    # -------------------
+    # Feasibility helpers
+    # -------------------
+    def _route_violates_forbidden(self, route: Route) -> bool:
+        """Return True if route uses any arc in self.forbidden_arcs."""
+        try:
+            t_arcs = route.compute_truck_arcs()
+            d_arcs = route.compute_drone_arcs()
+            for a in t_arcs:
+                if (int(a[0]), int(a[1])) in self.forbidden_arcs:
+                    return True
+            for a in d_arcs:
+                if (int(a[0]), int(a[1])) in self.forbidden_arcs:
+                    return True
+        except Exception:
+            # if route arc extraction fails, treat as violation to be safe
+            return True
+        return False
+
+    def _route_contains_forced(self, route: Route) -> bool:
+        """Return True if route contains all arcs in self.forced_arcs (if forced_arcs empty returns True)."""
+        if not self.forced_arcs:
+            return True
+        try:
+            arcs = set(route.compute_truck_arcs()) | set(route.compute_drone_arcs())
+            arcs_set = set((int(a[0]), int(a[1])) for a in arcs)
+            for required in self.forced_arcs:
+                if required not in arcs_set:
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def _accept_candidate_route(self, route: Route, duals: Duals) -> Optional[Column]:
+        """
+        Given a constructed Route, perform final checks:
+          - respects forbidden_arcs
+          - contains forced_arcs (if any)
+          - route.is_feasible() returns True
+          - compute reduced_cost and return Column if reduced_cost < 0
+        Otherwise return None.
+        """
+        # forbidden arcs
+        if self._route_violates_forbidden(route):
+            return None
+        # forced arcs presence
+        if not self._route_contains_forced(route):
+            return None
+        # feasibility
+        feasible_ok, reason = route.is_feasible()
+        if not feasible_ok:
+            return None
+        # reduced cost
+        rc = self._compute_reduced_cost_for_route(route, duals)
+        if not math.isfinite(rc):
+            return None
+        if rc < -1e-9:
+            try:
+                col = route.to_column()
+            except Exception:
+                # fallback: create Column-like object minimal
+                try:
+                    rid = getattr(route, "_route_id", None) or f"r_{int(time.time()*1000)}"
+                    a_ir = {i: 1 if i in route.covers() else 0 for i in range(1, self.instance.n + 1)}
+                    truck_arcs = route.compute_truck_arcs()
+                    drone_arcs = route.compute_drone_arcs()
+                    col = Column(route_id=rid, route=route, a_ir=a_ir, cost=float(route.cost()), truck_arcs=truck_arcs, drone_arcs=drone_arcs)
+                except Exception:
+                    return None
+            # attach reduced cost meta into column route or column meta (Column class does not have meta field, but we can set an attribute)
+            try:
+                setattr(col, "reduced_cost", float(rc))
+            except Exception:
+                pass
+            # add to column pool for deduplication (best-effort)
+            try:
+                self.column_pool.add(col)
+            except Exception:
+                # do not fail overall if pool add fails
+                logger.debug("ColumnPool.add() failed for column %s", getattr(col, "route_id", "<noid>"))
+            return col
+        return None
+
+    # -------------------
+    # Greedy deterministic
+    # -------------------
+    def greedy_deterministic(self, duals: Duals) -> List[Column]:
+        """
+        Deterministic greedy heuristic.
+
+        Behavior:
+          - Build one greedy truck route by iteratively appending the customer that minimizes:
+                score(j) = c_t * t_truck(cur, j) - pi_j + approx_SR_term
+            subject to quick feasibility filters (time window and truck capacity).
+          - From the constructed truck route produce:
+                * truck-only synthetic-route
+                * single-customer drone sorties (sep->j->r) for outer customers j not on truck route
+            Evaluate each candidate via full route.is_feasible() and exact reduced-cost; return negative columns.
+
+        Returns a list of Column objects (possibly empty).
+        """
+        start_time = time.time()
+        pi_map, sigma_dummy, zeta_map = self._validate_and_extract_duals(duals)
+        # quick config extras
+        heuristic_cfg = self._get_config_value("pricing", "heuristic_params") or {}
+        max_columns = heuristic_cfg.get("greedy_max_columns_to_return")  # may be None, that's OK
+        consider_sr = bool(heuristic_cfg.get("greedy_consider_sr", False))
+        allow_outer_drone = bool(heuristic_cfg.get("greedy_consider_drone_outer_nodes", True))
+        max_drone_size = heuristic_cfg.get(self._max_candidate_drone_sortie_size_key, 1)
+        if max_drone_size is None:
+            max_drone_size = 1
+        try:
+            max_drone_size = int(max_drone_size)
+        except Exception:
+            max_drone_size = 1
+
+        results: List[Column] = []
+
+        # Build greedy truck route
+        available_customers: Set[int] = set(range(1, self.instance.n + 1))
+        truck_seq: List[int] = [0]
+        current_node = 0
+        # compute truck load as sum of demands for customers assigned to truck_seq (we will keep it <= Q_t)
+        truck_load = 0.0
+        # track visited set for truck route
+        visited_truck: Set[int] = set()
+
+        # initial current time: earliest depot time
+        depot_tw = self.instance.time_windows.get(0, (0.0, 0.0))
+        current_time = float(depot_tw[0]) if depot_tw else 0.0
+
+        while True:
+            candidates = []
+            for j in sorted(list(available_customers)):
+                if j in visited_truck:
+                    continue
+                arc = (current_node, j)
+                if arc in self.forbidden_arcs:
+                    continue
+                # quick capacity check if truck served
+                demand_j = float(self.instance.demands.get(j, 0))
+                if (truck_load + demand_j) > float(self.instance.params.get("problem_parameters", {}).get("Q_t", self.instance.params.get("Q_t", float("inf")))):
+                    # skip candidate because truck would exceed capacity by serving j
+                    continue
+                # quick travel feasibility using time windows and L_t
+                try:
+                    tt = float(self.distances.t_truck(current_node, j))
+                    if not math.isfinite(tt):
+                        continue
+                except Exception:
+                    continue
+                arrival = current_time + tt
+                e_j, l_j = self.instance.time_windows.get(j, (0.0, float("inf")))
+                # If earliest possible arrival > latest, skip
+                if arrival > float(l_j) + 1e-9:
+                    continue
+                # optimistic return to depot check
+                try:
+                    back = float(self.distances.t_truck(j, self.instance.n + 1))
+                except Exception:
+                    back = float("inf")
+                # if arrival + back > L_t, skip
+                L_t = float(self.instance.params.get("problem_parameters", {}).get("L_t", self.instance.params.get("L_t", 480.0)))
+                if (arrival + back) > float(L_t) + 1e-9:
+                    continue
+
+                # compute score: marginal truck cost - pi_j + approx SR
+                marginal_truck_cost = self.c_t * tt
+                pi_j = float(pi_map.get(int(j), 0.0))
+                approx_sr = 0.0
+                if consider_sr and zeta_map:
+                    for S_tuple, zval in zeta_map.items():
+                        if int(j) in S_tuple:
+                            approx_sr += 0.5 * float(zval)
+                score = marginal_truck_cost - pi_j + approx_sr
+                candidates.append((score, j, tt, arrival, demand_j))
+
+            if not candidates:
+                break
+            # select best candidate (min score). deterministic tie-break
+            candidates.sort(key=lambda x: (float(x[0]), int(x[1])))
+            best_score, best_j, best_tt, best_arrival, best_demand = candidates[0]
+            # append best_j
+            truck_seq.append(int(best_j))
+            visited_truck.add(int(best_j))
+            truck_load += float(best_demand)
+            # update current_time: service may be included in tt (DistanceMatrix.t_truck includes service at arrival)
+            # but for next leg we set current_time = max(arrival, e_j) + service_time_j
+            e_j, l_j = self.instance.time_windows.get(best_j, (0.0, float("inf")))
+            service_time_j = 0.0
+            # try to extract service_time from distances.service_time_truck mapping
+            try:
+                node_idx = self.distances.node_index_map[best_j]
+                service_time_j = float(self.distances.service_time_truck[node_idx])
+            except Exception:
+                # fallback: if missing, try instance.params service_times
+                st = self.instance.params.get("service_times", {}) or {}
+                service_time_j = float(st.get("truck_service_time_minutes", 0.0))
+            # arrival might be earlier than e_j if truck waits; set start = max(arrival, e_j)
+            start_service = max(float(best_arrival), float(e_j))
+            current_time = start_service + float(service_time_j)
+            current_node = int(best_j)
+            # loop continues
+
+        # Finish truck route by returning to depot
+        truck_seq.append(self.instance.n + 1)
+
+        # Candidate 1: truck-only route
+        try:
+            route_truck_only = Route(truck_seq=truck_seq, drone_sorties=[], instance=self.instance, distances=self.distances, config=self.config)
+            col = self._accept_candidate_route(route_truck_only, duals)
+            if col is not None:
+                results.append(col)
+                if (max_columns is not None) and len(results) >= int(max_columns):
+                    return sorted(results, key=lambda c: getattr(c, "reduced_cost", float(c.cost)))[: int(max_columns)]
+        except Exception:
+            # ignore errors in constructing truck-only route
+            pass
+
+        # Candidate 2: single-customer drone sorties (outer nodes) - consider customers not in truck_seq if allowed
+        candidates_customers_for_drone = set(self.instance.D) - set(truck_seq)
+        if not allow_outer_drone:
+            # Only consider drone customers that are on truck_seq (unlikely here) - skip outer nodes
+            candidates_customers_for_drone = set()
+
+        # For each separation index and rendezvous index, try single-customer sorties
+        # To limit expensive checks, we restrict to single-customer sorties by default (multi-customer controlled by config)
+        for s_idx in range(len(truck_seq) - 1):
+            sep_node = int(truck_seq[s_idx])
+            for r_idx in range(s_idx + 1, len(truck_seq)):
+                rendez_node = int(truck_seq[r_idx])
+                # Try each candidate customer j
+                for j in sorted(list(candidates_customers_for_drone)):
+                    # Build route with one sortie: sep -> [j] -> rendez
+                    sortie = (sep_node, [int(j)], rendez_node)
+                    candidate_route = None
+                    try:
+                        candidate_route = Route(truck_seq=truck_seq, drone_sorties=[sortie], instance=self.instance, distances=self.distances, config=self.config)
+                    except Exception:
+                        # invalid sortie construction (e.g., j not eligible) skip
+                        continue
+                    # quick check for forbidden arcs: check the drone arcs (sep->j) and (j->rendez)
+                    drone_arcs = candidate_route.compute_drone_arcs()
+                    bad = False
+                    for a in drone_arcs:
+                        if (int(a[0]), int(a[1])) in self.forbidden_arcs:
+                            bad = True
+                            break
+                    if bad:
+                        continue
+                    # Now full acceptance check
+                    col = self._accept_candidate_route(candidate_route, duals)
+                    if col is not None:
+                        results.append(col)
+                        if (max_columns is not None) and len(results) >= int(max_columns):
+                            # return top columns by reduced cost
+                            results_sorted = sorted(results, key=lambda c: getattr(c, "reduced_cost", float(c.cost)))
+                            return results_sorted[: int(max_columns)]
+
+        # Optionally extension: multi-customer sorties up to configured size (but we do not invent default >1)
+        max_multi = int(max_drone_size) if max_drone_size is not None else 1
+        if max_multi >= 2 and allow_outer_drone:
+            # For performance, only try simple pairs (size==2). We will try combinations of two outer customers.
+            # Must ensure config explicitly provided max_drone_sortie_customers to allow multi-customer tries.
+            # If the config key was provided and >=2, we attempt pairs.
+            outer_candidates = sorted(list(candidates_customers_for_drone))
+            if len(outer_candidates) >= 2:
+                # iterate over pairs (avoid combinatorial explosion)
+                for s_idx in range(len(truck_seq) - 1):
+                    sep_node = int(truck_seq[s_idx])
+                    for r_idx in range(s_idx + 1, len(truck_seq)):
+                        rendez_node = int(truck_seq[r_idx])
+                        # consider pairs
+                        for idx_a in range(len(outer_candidates)):
+                            for idx_b in range(idx_a + 1, len(outer_candidates)):
+                                j1 = outer_candidates[idx_a]
+                                j2 = outer_candidates[idx_b]
+                                sortie = (sep_node, [int(j1), int(j2)], rendez_node)
+                                try:
+                                    candidate_route = Route(truck_seq=truck_seq, drone_sorties=[sortie], instance=self.instance, distances=self.distances, config=self.config)
+                                except Exception:
+                                    continue
+                                # forbidden arcs check
+                                bad = False
+                                for a in candidate_route.compute_drone_arcs():
+                                    if (int(a[0]), int(a[1])) in self.forbidden_arcs:
+                                        bad = True
+                                        break
+                                if bad:
+                                    continue
+                                col = self._accept_candidate_route(candidate_route, duals)
+                                if col is not None:
+                                    results.append(col)
+                                    if (max_columns is not None) and len(results) >= int(max_columns):
+                                        results_sorted = sorted(results, key=lambda c: getattr(c, "reduced_cost", float(c.cost)))
+                                        return results_sorted[: int(max_columns)]
+
+        # sort results by reduced_cost (most negative first)
+        results_sorted = sorted(results, key=lambda c: getattr(c, "reduced_cost", float(c.cost)))
+        if max_columns is not None:
+            results_sorted = results_sorted[: int(max_columns)]
+        elapsed = time.time() - start_time
+        logger.debug("greedy_deterministic produced %d columns in %.3fs", len(results_sorted), elapsed)
+        return results_sorted
+
+    # -------------------
+    # Greedy randomized
+    # -------------------
+    def greedy_randomized(self, duals: Duals, repeats: Optional[int] = None) -> List[Column]:
+        """
+        Randomized greedy heuristic.
+
+        Requires config entries:
+          - pricing.heuristic_params.greedy_random_restarts (or repeats argument provided)
+          - pricing.heuristic_params.greedy_random_top_k (int) : top-k candidates to sample from each step
+
+        If required config keys are missing, raises ValueError.
+
+        Behaviour:
+          - For each restart: build route by choosing next node uniformly at random among the top-k
+            candidates (by same score used in deterministic greedy).
+          - After building each truck route, expand with same drone sortie attempts as deterministic (single-customer,
+            optionally multi-customer subject to config.max_drone_sortie_customers).
+          - Aggregate negative reduced-cost columns across repeats, deduplicate using ColumnPool.
+        """
+        # Validate required config keys
+        heuristic_cfg = self._get_config_value("pricing", "heuristic_params") or {}
+        top_k = heuristic_cfg.get("greedy_random_top_k")
+        if top_k is None:
+            raise ValueError("greedy_randomized requires configuration 'pricing.heuristic_params.greedy_random_top_k' to be set (number of top candidates to sample from).")
+        try:
+            top_k = int(top_k)
+            if top_k <= 0:
+                raise ValueError()
+        except Exception:
+            raise ValueError("'pricing.heuristic_params.greedy_random_top_k' must be a positive integer.")
+
+        # repeats argument or config value
+        restarts = repeats if (repeats is not None) else heuristic_cfg.get("greedy_random_restarts")
+        if restarts is None:
+            raise ValueError("greedy_randomized requires 'greedy_random_restarts' either passed as repeats or set in config.pricing.heuristic_params.greedy_random_restarts.")
+        try:
+            restarts = int(restarts)
+            if restarts <= 0:
+                raise ValueError()
+        except Exception:
+            raise ValueError("'greedy_random_restarts' must be a positive integer.")
+
+        # stop_on_first_found optional
+        stop_on_first = bool(heuristic_cfg.get("greedy_random_stop_on_first_found", False))
+        max_columns = heuristic_cfg.get("greedy_max_columns_to_return")
+
+        results_map: Dict[str, Column] = {}
+
+        for run in range(int(restarts)):
+            # Build randomized greedy truck route
+            available_customers: Set[int] = set(range(1, self.instance.n + 1))
+            truck_seq: List[int] = [0]
+            current_node = 0
+            truck_load = 0.0
+            current_time = float(self.instance.time_windows.get(0, (0.0, 0.0))[0])
+
+            while True:
+                candidates = []
+                for j in sorted(list(available_customers)):
+                    if j in truck_seq:
+                        continue
+                    arc = (current_node, j)
+                    if arc in self.forbidden_arcs:
+                        continue
+                    demand_j = float(self.instance.demands.get(j, 0))
+                    if (truck_load + demand_j) > float(self.instance.params.get("problem_parameters", {}).get("Q_t", self.instance.params.get("Q_t", float("inf")))):
+                        continue
+                    try:
+                        tt = float(self.distances.t_truck(current_node, j))
+                        if not math.isfinite(tt):
+                            continue
+                    except Exception:
+                        continue
+                    arrival = current_time + tt
+                    e_j, l_j = self.instance.time_windows.get(j, (0.0, float("inf")))
+                    if arrival > float(l_j) + 1e-9:
+                        continue
+                    try:
+                        back = float(self.distances.t_truck(j, self.instance.n + 1))
+                    except Exception:
+                        back = float("inf")
+                    L_t = float(self.instance.params.get("problem_parameters", {}).get("L_t", self.instance.params.get("L_t", 480.0)))
+                    if (arrival + back) > float(L_t) + 1e-9:
+                        continue
+                    # score as in deterministic
+                    marginal_truck_cost = self.c_t * tt
+                    pi_j = float(duals.get("pi", {}).get(int(j), 0.0))
+                    approx_sr = 0.0
+                    if bool(heuristic_cfg.get("greedy_consider_sr", False)) and duals.get("zeta"):
+                        for S_tuple, zval in duals.get("zeta", {}).items():
+                            # normalize S_tuple to iterable ints
+                            try:
+                                if int(j) in (tuple(S_tuple) if isinstance(S_tuple, (list, tuple)) else (S_tuple,)):
+                                    approx_sr += 0.5 * float(zval)
+                            except Exception:
+                                # try fallback parsing
+                                try:
+                                    keyt = tuple(sorted(int(x) for x in S_tuple))
+                                    if int(j) in keyt:
+                                        approx_sr += 0.5 * float(zval)
+                                except Exception:
+                                    continue
+                    score = marginal_truck_cost - pi_j + approx_sr
+                    candidates.append((score, j, tt, arrival, demand_j))
+                if not candidates:
+                    break
+                # pick top_k candidates by score
+                candidates.sort(key=lambda x: (float(x[0]), int(x[1])))
+                top_candidates = candidates[:top_k]
+                # select randomly among top_candidates
+                idx = int(self.rng.randint(0, len(top_candidates)))
+                chosen = top_candidates[idx]
+                chosen_j = int(chosen[1])
+                chosen_tt = float(chosen[2])
+                chosen_arrival = float(chosen[3])
+                chosen_demand = float(chosen[4])
+                truck_seq.append(chosen_j)
+                truck_load += chosen_demand
+                # update current_time as before
+                e_j, _ = self.instance.time_windows.get(chosen_j, (0.0, float("inf")))
+                # service_time
+                try:
+                    node_idx = self.distances.node_index_map[chosen_j]
+                    svc = float(self.distances.service_time_truck[node_idx])
+                except Exception:
+                    svc = float(self.instance.params.get("service_times", {}).get("truck_service_time_minutes", 0.0))
+                start_service = max(chosen_arrival, float(e_j))
+                current_time = start_service + svc
+                current_node = chosen_j
+
+            truck_seq.append(self.instance.n + 1)
+
+            # As in deterministic, consider truck-only and single-customer drone sorties
+            try:
+                route_truck_only = Route(truck_seq=truck_seq, drone_sorties=[], instance=self.instance, distances=self.distances, config=self.config)
+                col = self._accept_candidate_route(route_truck_only, duals)
+                if col is not None:
+                    results_map[getattr(col, "route_id", str(hash(str(col.serialize()) if hasattr(col, "serialize") else col)))] = col
+                    if stop_on_first:
+                        return list(results_map.values())
+                    if (max_columns is not None) and len(results_map) >= int(max_columns):
+                        return list(results_map.values())[: int(max_columns)]
+            except Exception:
+                pass
+
+            # consider single-customer outer drone sorties
+            candidates_customers_for_drone = set(self.instance.D) - set(truck_seq)
+            allow_outer_drone = bool(heuristic_cfg.get("greedy_consider_drone_outer_nodes", True))
+            if not allow_outer_drone:
+                candidates_customers_for_drone = set()
+            for s_idx in range(len(truck_seq) - 1):
+                sep_node = int(truck_seq[s_idx])
+                for r_idx in range(s_idx + 1, len(truck_seq)):
+                    rendez_node = int(truck_seq[r_idx])
+                    for j in sorted(list(candidates_customers_for_drone)):
+                        sortie = (sep_node, [int(j)], rendez_node)
+                        try:
+                            candidate_route = Route(truck_seq=truck_seq, drone_sorties=[sortie], instance=self.instance, distances=self.distances, config=self.config)
+                        except Exception:
+                            continue
+                        # forbidden arcs quick check
+                        bad = False
+                        for a in candidate_route.compute_drone_arcs():
+                            if (int(a[0]), int(a[1])) in self.forbidden_arcs:
+                                bad = True
+                                break
+                        if bad:
+                            continue
+                        col = self._accept_candidate_route(candidate_route, duals)
+                        if col is not None:
+                            results_map[getattr(col, "route_id", str(hash(str(col.serialize()) if hasattr(col, "serialize") else col)))] = col
+                            if stop_on_first:
+                                return list(results_map.values())
+                            if (max_columns is not None) and len(results_map) >= int(max_columns):
+                                return list(results_map.values())[: int(max_columns)]
+
+        # return deduplicated columns, sorted by reduced cost
+        results_list = list(results_map.values())
+        results_list.sort(key=lambda c: getattr(c, "reduced_cost", float(c.cost)))
+        if heuristic_cfg.get("greedy_max_columns_to_return") is not None:
+            results_list = results_list[: int(heuristic_cfg.get("greedy_max_columns_to_return"))]
+        return results_list
+
+    # -------------------
+    # Tabu search
+    # -------------------
+    def tabu_search(self, seed_routes: Iterable[Any], duals: Duals) -> List[Column]:
+        """
+        Tabu search improvement starting from provided seed_routes.
+
+        Required config entries under pricing.heuristic_params:
+          - tabu_tenure (int)
+          - tabu_max_iterations (int)
+          - tabu_no_improve_limit (int)
+
+        Optional:
+          - tabu_candidate_sample (int) : sample size when exploring insert candidates (to limit work)
+          - tabu_stop_on_first_negative (bool)
+
+        seed_routes: iterable of Route objects or Column objects (if Column, .route is used).
+
+        Returns list of Columns (negative reduced-cost) found by Tabu.
+        """
+        heuristic_cfg = self._get_config_value("pricing", "heuristic_params") or {}
+        # required params
+        required = ["tabu_tenure", "tabu_max_iterations", "tabu_no_improve_limit"]
+        missing = [k for k in required if heuristic_cfg.get(k) is None]
+        if missing:
+            raise ValueError(f"tabu_search requires configuration keys in pricing.heuristic_params: {missing}")
+
+        try:
+            tabu_tenure = int(heuristic_cfg["tabu_tenure"])
+            max_iters = int(heuristic_cfg["tabu_max_iterations"])
+            no_improve_limit = int(heuristic_cfg["tabu_no_improve_limit"])
+        except Exception:
+            raise ValueError("tabu_search parameters must be integers: tabu_tenure, tabu_max_iterations, tabu_no_improve_limit")
+
+        candidate_sample = heuristic_cfg.get("tabu_candidate_sample")
+        if candidate_sample is not None:
+            try:
+                candidate_sample = int(candidate_sample)
+            except Exception:
+                candidate_sample = None
+
+        stop_on_first_negative = bool(heuristic_cfg.get("tabu_stop_on_first_negative", False))
+
+        results_found: Dict[str, Column] = {}
+
+        # Normalize seed_routes to Route objects
+        seed_routes_normalized: List[Route] = []
+        for s in seed_routes:
+            if s is None:
+                continue
+            if isinstance(s, Column):
+                if getattr(s, "route", None) is not None:
+                    seed_routes_normalized.append(s.route)
+                else:
+                    continue
+            elif isinstance(s, Route):
+                seed_routes_normalized.append(s)
+            else:
+                # try to extract route attribute
+                route_attr = getattr(s, "route", None)
+                if isinstance(route_attr, Route):
+                    seed_routes_normalized.append(route_attr)
+                else:
+                    # cannot interpret seed; skip
+                    continue
+
+        # If no seeds, nothing to do
+        if not seed_routes_normalized:
+            return []
+
+        # Main Tabu loop per seed
+        for seed_idx, seed_route in enumerate(seed_routes_normalized):
+            try:
+                seed_rc = self._compute_reduced_cost_for_route(seed_route, duals)
+            except Exception:
+                seed_rc = float("inf")
+            # initialize
+            current_route = seed_route
+            current_rc = seed_rc
+            best_route = seed_route if current_rc < 0.0 else None
+            best_rc = current_rc if current_rc is not None else float("inf")
+            # tabu list: map move key -> remaining tenure (int)
+            tabu_dict: Dict[Tuple[str, Any], int] = {}
+            no_improve_counter = 0
+
+            for iteration in range(1, max_iters + 1):
+                # generate neighborhood moves (removals and insertions)
+                neighbors: List[Tuple[Route, float, Tuple[str, Any]]] = []  # (route, reduced_cost, move_key)
+                # REMOVAL moves: remove a single truck-served customer (not depot) if safe
+                try:
+                    truck_seq = list(current_route.truck_seq)
+                except Exception:
+                    truck_seq = []
+
+                # build set of customers currently in route (truck-served)
+                current_truck_customers = [node for node in truck_seq if 1 <= node <= self.instance.n]
+                for u in current_truck_customers:
+                    # don't remove if doing so would remove forced arc requirements (quick check)
+                    # Simpler: build candidate route and let is_feasible prune invalid ones
+                    if len(truck_seq) <= 2:
+                        continue
+                    # create new truck seq without u
+                    try:
+                        new_truck_seq = [n for n in truck_seq if n != u]
+                        if new_truck_seq[0] != 0:
+                            new_truck_seq = [0] + new_truck_seq
+                        if new_truck_seq[-1] != self.instance.n + 1:
+                            new_truck_seq = new_truck_seq + [self.instance.n + 1]
+                        candidate_route = Route(truck_seq=new_truck_seq, drone_sorties=current_route.drone_sorties, instance=self.instance, distances=self.distances, config=self.config)
+                    except Exception:
+                        continue
+                    # quick forbidden arcs check
+                    if self._route_violates_forbidden(candidate_route):
+                        continue
+                    # compute reduced cost (full)
+                    rc = self._compute_reduced_cost_for_route(candidate_route, duals)
+                    move_key = ("remove", int(u))
+                    neighbors.append((candidate_route, rc, move_key))
+
+                # INSERTION moves: pick customers not currently in route and attempt insert into truck_seq positions
+                # Candidates set: customers not already served by route (truck or drone)
+                try:
+                    covered_now = current_route.covers()
+                except Exception:
+                    covered_now = set()
+                candidate_pool = [c for c in range(1, self.instance.n + 1) if c not in covered_now]
+                # sampling if too big
+                if candidate_sample is not None and len(candidate_pool) > candidate_sample:
+                    # choose a deterministic sample using RNG
+                    candidate_pool = list(self.rng.choice(np.array(candidate_pool, dtype=int), size=candidate_sample, replace=False))
+
+                for c in candidate_pool:
+                    # attempt insertion in each possible position between nodes in truck_seq
+                    for pos in range(1, max(1, len(truck_seq))):  # positions between nodes
+                        new_truck_seq = truck_seq[:pos] + [int(c)] + truck_seq[pos:]
+                        try:
+                            candidate_route = Route(truck_seq=new_truck_seq, drone_sorties=current_route.drone_sorties, instance=self.instance, distances=self.distances, config=self.config)
+                        except Exception:
+                            continue
+                        if self._route_violates_forbidden(candidate_route):
+                            continue
+                        rc = self._compute_reduced_cost_for_route(candidate_route, duals)
+                        move_key = ("insert", int(c), int(pos))
+                        neighbors.append((candidate_route, rc, move_key))
+
+                # If no neighbors, break
+                if not neighbors:
+                    break
+
+                # Sort neighbors by reduced cost (ascending) and evaluate tabu criteria
+                neighbors.sort(key=lambda x: float(x[1]))
+                selected = None
+                selected_move_key = None
+                selected_rc = None
+
+                for candidate_route, rc, move_key in neighbors:
+                    # check tabu
+                    tabu_remaining = tabu_dict.get(move_key, 0)
+                    if tabu_remaining > 0:
+                        # aspiration criterion: if rc < best_rc (i.e., strictly better than best found), allow
+                        if best_route is None or rc < float(best_rc) - 1e-9:
+                            selected = candidate_route
+                            selected_rc = rc
+                            selected_move_key = move_key
+                            break
+                        else:
+                            continue
+                    else:
+                        selected = candidate_route
+                        selected_rc = rc
+                        selected_move_key = move_key
+                        break
+
+                if selected is None:
+                    # all moves tabu and none meets aspiration; decrease tenure and continue
+                    # reduce tabu tenures
+                    tabu_dict = {k: max(0, v - 1) for k, v in tabu_dict.items() if v - 1 > 0}
+                    no_improve_counter += 1
+                    if no_improve_counter >= no_improve_limit:
+                        break
+                    continue
+
+                # Apply selected move: set current_route = selected
+                current_route = selected
+                current_rc = float(selected_rc)
+
+                # Update tabu: decrement existing
+                for k in list(tabu_dict.keys()):
+                    tabu_dict[k] = max(0, tabu_dict[k] - 1)
+                    if tabu_dict[k] <= 0:
+                        del tabu_dict[k]
+                # add reverse move as tabu to prevent immediate reversal
+                # For ('remove', u) reverse is ('insert', u, pos) - but we don't store pos; we store a generic remove/insert
+                # To keep simple, we mark the move_key itself tabu with tenure
+                tabu_dict[selected_move_key] = int(tabu_tenure)
+
+                # Update best found
+                if current_rc < float(best_rc) - 1e-9:
+                    best_route = current_route
+                    best_rc = float(current_rc)
+                    no_improve_counter = 0
+                else:
+                    no_improve_counter += 1
+
+                # Termination criteria
+                if best_route is not None and best_rc < 0.0 and stop_on_first_negative:
+                    break
+                if no_improve_counter >= no_improve_limit:
+                    break
+
+            # end iterations for this seed
+            if best_route is not None and float(best_rc) < 0.0:
+                # produce Column for best_route
+                col = self._accept_candidate_route(best_route, duals)
+                if col is not None:
+                    results_found[getattr(col, "route_id", str(hash(str(col.serialize()) if hasattr(col, "serialize") else col)))] = col
+                    if stop_on_first_negative:
+                        return list(results_found.values())
+
+        # return list of found Columns sorted by reduced cost
+        res_list = list(results_found.values())
+        res_list.sort(key=lambda c: getattr(c, "reduced_cost", float(c.cost)))
+        return res_list
+```

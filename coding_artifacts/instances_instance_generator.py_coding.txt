@@ -1,0 +1,474 @@
+```python
+## instances/instance_generator.py
+
+"""
+Instance generator for the TD-DRPTW reproduction project.
+
+Implements the InstanceGenerator class (see design). This module produces instances
+according to the paper's instance-generation procedure (Section 5.1) and the provided
+config.yaml. It writes instance JSON files using the Instance.save() method and
+maintains a small manifest instances/manifest.json summarizing generated instances.
+
+Public API:
+- class InstanceGenerator:
+    - __init__(config: Union[Dict,str,None], logger: Optional[Logger] = None)
+    - generate_one(type_index: int, n: int, theta: float, replicate: int) -> Instance
+    - generate_all() -> List[Instance]
+
+Notes:
+- Deterministic seeding: per-instance seed computed from base_seed + 1000*type_index + 100*n + 10*round(theta*100) + replicate.
+- Uses numpy.random.RandomState with the computed seed to ensure reproducibility.
+- Defaults are provided for configuration keys that are not present. All such defaults
+  are conservative and documented in code comments and per-instance metadata.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+import numpy as np
+
+# Import Instance class defined in instances/instance.py
+from instances.instance import Instance
+
+# Optional logger (from utils.logger). Use if available; otherwise fallback to simple prints.
+try:
+    from utils.logger import Logger  # type: ignore
+except Exception:
+    Logger = None  # type: ignore
+
+
+# Helper for ISO timestamp
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ensure_dir(path: Union[str, Path]) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+class InstanceGenerator:
+    """
+    Generate TD-DRPTW instances as described in the paper and config.yaml.
+
+    Constructor:
+        InstanceGenerator(config: Union[Dict,str,None], logger: Optional[Logger]=None)
+
+    Methods:
+        - generate_one(type_index: int, n: int, theta: float, replicate: int) -> Instance
+        - generate_all() -> List[Instance]
+    """
+
+    def __init__(self, config: Optional[Union[Dict[str, Any], str]] = None, logger: Optional[Any] = None) -> None:
+        """
+        Initialize the generator.
+
+        Args:
+            config: either a dict-like config or a path to a YAML/JSON config file. If None,
+                    sensible defaults are used consistent with the paper.
+            logger: optional Logger instance (utils.logger.Logger). If omitted and utils.logger is
+                    available, a Logger with run_id 'instance_generator' will be constructed.
+        """
+        # Load config (dict or path)
+        cfg = {}
+        if config is None:
+            cfg = {}
+        elif isinstance(config, dict):
+            cfg = dict(config)
+        elif isinstance(config, str):
+            # try to load YAML or JSON file
+            try:
+                import yaml  # local import
+            except Exception:
+                yaml = None  # type: ignore
+            p = Path(config)
+            if not p.exists():
+                raise FileNotFoundError(f"Config file not found: {config}")
+            if yaml is not None and p.suffix in {".yml", ".yaml"}:
+                with open(p, "rt", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            else:
+                # try JSON
+                with open(p, "rt", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            if not isinstance(cfg, dict):
+                cfg = {}
+
+        # Defaults consistent with config.yaml provided in the reproducibility plan / paper
+        # Instance generation defaults
+        ig = cfg.get("instance_generation", {}) or {}
+        coord_grid = ig.get("coord_grid", {}) or {}
+        self.grid_start: float = float(coord_grid.get("start", 0.0))
+        self.grid_end: float = float(coord_grid.get("end", 15.0))
+        self.grid_step: float = float(coord_grid.get("step", 0.5))
+        self.instance_types: int = int(ig.get("instance_types", 3))
+        self.n_values: List[int] = list(ig.get("n_values", [10, 20, 30, 35, 40, 45]))
+        self.theta_values: List[float] = list(ig.get("theta_values", [0.1, 0.3, 0.5, 0.7, 0.9]))
+        self.replicates_per_setting: int = int(ig.get("replicates_per_setting", 3))
+        demand_cfg = ig.get("demand_sampling", {}) or {}
+        self.demand_values: List[int] = list(demand_cfg.get("values", [10, 20, 30, 40, 50]))
+
+        # Time window generation defaults
+        tw = ig.get("time_window_generation", {}) or {}
+        half_w = tw.get("half_width_distribution", {}) or {}
+        self.tw_half_mu: float = float(half_w.get("mu", 30.0))
+        self.tw_half_sigma: float = float(half_w.get("sigma", 10.0))
+        self.solomon_center_method: bool = bool(tw.get("solomon_center_method", True))
+
+        # Drone-eligibility rounding rule: 'round'|'floor'|'ceil'
+        self.d_count_rule: str = str(ig.get("drone_count_rounding", "round")).lower()
+        if self.d_count_rule not in {"round", "floor", "ceil"}:
+            # fallback to round
+            self.d_count_rule = "round"
+
+        # Cluster generation parameters (type 3)
+        cluster_cfg = ig.get("cluster_generation", {}) or {}
+        gamma_cfg = cluster_cfg.get("gamma_distribution", {}) or {}
+        self.cluster_gamma_mu: float = float(gamma_cfg.get("mu", 0.0))
+        self.cluster_gamma_sigma: float = float(gamma_cfg.get("sigma", 10.0))
+        # phi distribution is uniform [0, 2*pi]
+        # seeds
+        seeds_cfg = ig.get("seeds", {}) or {}
+        self.base_seed: int = int(seeds_cfg.get("base_seed", 123456))
+
+        # Problem parameters (copy some defaults from config.yaml / paper)
+        prob = cfg.get("problem_parameters", {}) or {}
+        self.L_t: float = float(prob.get("L_t", 480.0))  # minutes
+
+        # Output / paths
+        out = cfg.get("output", {}) or {}
+        self.instances_dir: Path = Path(out.get("instances_dir", "instances"))
+        _ensure_dir(self.instances_dir)
+
+        # Manifest path
+        self.manifest_path: Path = self.instances_dir / "manifest.json"
+        if not self.manifest_path.exists():
+            # create empty manifest
+            try:
+                with open(self.manifest_path, "wt", encoding="utf-8") as mf:
+                    json.dump({"instances": []}, mf, indent=2)
+            except Exception:
+                # ignore write failure until needed
+                pass
+
+        # store configuration snapshot
+        self._config = cfg
+
+        # logger
+        if logger is not None:
+            self._logger = logger
+        else:
+            if Logger is not None:
+                try:
+                    self._logger = Logger(run_id="instance_generator", instance_id=None, config=cfg)
+                except Exception:
+                    self._logger = None
+            else:
+                self._logger = None
+
+    # ----------------------
+    # Public API
+    # ----------------------
+    def generate_one(self, type_index: int, n: int, theta: float, replicate: int) -> Instance:
+        """
+        Generate a single instance.
+
+        Args:
+            type_index: 1, 2, or 3 corresponding to the three types described in the paper.
+            n: number of customers
+            theta: fraction of customers that are drone-eligible (in [0,1])
+            replicate: replicate index (0..replicates_per_setting-1)
+
+        Returns:
+            Instance object (and saves it to disk at instances_dir).
+
+        The generated instance is saved to:
+            <instances_dir>/instance_type{type_index}_n{n}_theta{theta}_rep{replicate}.json
+
+        Notes:
+          - Uses deterministic per-instance seed computed from base_seed and params.
+          - All random draws use numpy.RandomState for reproducibility.
+        """
+        # validate inputs
+        if type_index not in {1, 2, 3}:
+            raise ValueError("type_index must be 1, 2, or 3")
+        if n <= 0:
+            raise ValueError("n must be positive integer")
+        if not (0.0 <= theta <= 1.0):
+            raise ValueError("theta must be in [0,1]")
+        if replicate < 0:
+            raise ValueError("replicate must be non-negative integer")
+
+        # compute seed deterministically
+        theta_int = int(round(float(theta) * 100.0))
+        per_instance_seed = int(self.base_seed) + 1000 * int(type_index) + 100 * int(n) + 10 * int(theta_int) + int(replicate)
+        # ensure seed fits 32-bit positive integer range
+        per_instance_seed = int(per_instance_seed & 0x7FFFFFFF)
+
+        rng = np.random.RandomState(per_instance_seed)
+
+        # generate coordinates
+        coords_customers: Dict[int, Tuple[float, float]] = {}
+        if type_index in (1, 2):
+            # construct grid values
+            # ensure grid_end >= grid_start and step > 0
+            if self.grid_step <= 0 or self.grid_end < self.grid_start:
+                raise ValueError("Invalid coord_grid in configuration (start/end/step)")
+            num = int(round((self.grid_end - self.grid_start) / self.grid_step)) + 1
+            # create grid as numpy array of floats
+            grid_vals = np.array([round(self.grid_start + i * self.grid_step, 8) for i in range(num)], dtype=float)
+            # sample x and y coordinates independently from grid
+            xs = rng.choice(grid_vals, size=n, replace=True)
+            ys = rng.choice(grid_vals, size=n, replace=True)
+            for i in range(1, n + 1):
+                coords_customers[i] = (float(xs[i - 1]), float(ys[i - 1]))
+            # depot
+            if type_index == 1:
+                depot_x = float(rng.choice(grid_vals))
+                depot_y = float(rng.choice(grid_vals))
+            else:  # type_index == 2
+                depot_x = float(xs.mean())
+                depot_y = float(ys.mean())
+        else:
+            # type_index == 3 clustered
+            gammas = rng.normal(loc=float(self.cluster_gamma_mu), scale=float(self.cluster_gamma_sigma), size=n)
+            phis = rng.uniform(low=0.0, high=2.0 * math.pi, size=n)
+            for idx in range(n):
+                gamma = float(gammas[idx])
+                phi = float(phis[idx])
+                x = float(gamma * math.cos(phi))
+                y = float(gamma * math.sin(phi))
+                coords_customers[idx + 1] = (x, y)
+            depot_x = 0.0
+            depot_y = 0.0
+
+        # compose coords dict for nodes 0..n+1 (depots have same coordinate)
+        coords: Dict[int, Tuple[float, float]] = {}
+        coords[0] = (depot_x, depot_y)
+        for i in range(1, n + 1):
+            coords[i] = coords_customers[i]
+        coords[n + 1] = (depot_x, depot_y)
+
+        # demands
+        if not self.demand_values:
+            raise ValueError("demand sampling values are empty in configuration")
+        demands: Dict[int, int] = {}
+        for i in range(1, n + 1):
+            demands[i] = int(rng.choice(self.demand_values))
+        demands[0] = 0
+        demands[n + 1] = 0
+
+        # compute D set (drone-eligible)
+        raw_count = float(n) * float(theta)
+        if self.d_count_rule == "floor":
+            D_count = int(math.floor(raw_count))
+        elif self.d_count_rule == "ceil":
+            D_count = int(math.ceil(raw_count))
+        else:
+            # round to nearest integer
+            D_count = int(round(raw_count))
+        # clamp to [0, n]
+        D_count = max(0, min(n, D_count))
+        customers_list = list(range(1, n + 1))
+        if D_count == 0:
+            D_set: Set[int] = set()
+        else:
+            # rng.choice produces numpy ints; ensure python ints and no replacement
+            chosen = rng.choice(np.array(customers_list, dtype=int), size=D_count, replace=False)
+            D_set = set(int(x) for x in chosen)
+
+        # time windows
+        time_windows: Dict[int, Tuple[float, float]] = {}
+        # depot
+        time_windows[0] = (0.0, float(self.L_t))
+        time_windows[n + 1] = (0.0, float(self.L_t))
+        for i in range(1, n + 1):
+            # sample half-width
+            h = float(rng.normal(loc=float(self.tw_half_mu), scale=float(self.tw_half_sigma)))
+            if not math.isfinite(h) or h <= 0.0:
+                # enforce positive half-width
+                h = max(1.0, abs(h))
+            # center method: uniform in [0, L_t] per our documented default Solomon handling
+            if self.solomon_center_method:
+                c = float(rng.uniform(0.0, float(self.L_t)))
+            else:
+                # fallback to uniform as well
+                c = float(rng.uniform(0.0, float(self.L_t)))
+            e = max(0.0, c - h)
+            l = min(float(self.L_t), c + h)
+            # safety clamp
+            if e > l:
+                # set minimal width of 1 minute around c
+                e = max(0.0, c - 1.0)
+                l = min(float(self.L_t), c + 1.0)
+            time_windows[i] = (float(e), float(l))
+
+        # params metadata snapshot for Instance.params
+        params_meta: Dict[str, Any] = {}
+        params_meta["generation"] = {
+            "type_index": int(type_index),
+            "n": int(n),
+            "theta": float(theta),
+            "replicate": int(replicate),
+            "per_instance_seed": int(per_instance_seed),
+            "d_count_rule": str(self.d_count_rule),
+            "d_set_size": int(D_count),
+            "coord_grid": {"start": float(self.grid_start), "end": float(self.grid_end), "step": float(self.grid_step)},
+            "cluster_gamma": {"mu": float(self.cluster_gamma_mu), "sigma": float(self.cluster_gamma_sigma)},
+            "tw_half_width": {"mu": float(self.tw_half_mu), "sigma": float(self.tw_half_sigma)},
+            "tw_center_method": "uniform_center" if self.solomon_center_method else "uniform_center_fallback",
+            "demand_values": list(self.demand_values),
+        }
+        # include problem parameters minimally required (L_t)
+        params_meta["problem_parameters"] = {"L_t": float(self.L_t)}
+
+        # instance id and filename
+        theta_str = str(theta).replace(".", "_")
+        inst_id = f"type{type_index}_n{n}_theta{theta_str}_rep{replicate}"
+        filename = f"instance_type{type_index}_n{n}_theta{theta_str}_rep{replicate}.json"
+        out_path = self.instances_dir / filename
+
+        # assemble Instance object
+        instance = Instance(
+            id=inst_id,
+            n=n,
+            coords=coords,
+            demands=demands,
+            time_windows=time_windows,
+            D=D_set,
+            params=params_meta,
+            meta={"generated_at": _now_iso()},
+        )
+
+        # validate instance (raise on error)
+        instance.validate(raise_on_error=True, auto_fix=False)
+
+        # save to disk
+        saved_path = instance.save(out_path)
+
+        # update manifest
+        manifest_entry = {
+            "instance_id": inst_id,
+            "file": str(saved_path),
+            "type_index": int(type_index),
+            "n": int(n),
+            "theta": float(theta),
+            "replicate": int(replicate),
+            "seed": int(per_instance_seed),
+            "d_set_size": int(D_count),
+            "created_at": instance.meta.get("generated_at", _now_iso()),
+            "params_summary": {
+                "coord_grid": params_meta["generation"]["coord_grid"],
+                "tw_half_width": params_meta["generation"]["tw_half_width"],
+                "tw_center": params_meta["generation"]["tw_center_method"],
+            },
+        }
+        # append to manifest atomically (read-modify-write)
+        try:
+            # load existing manifest
+            if self.manifest_path.exists():
+                with open(self.manifest_path, "rt", encoding="utf-8") as mf:
+                    manifest_obj = json.load(mf) or {}
+            else:
+                manifest_obj = {"instances": []}
+            if "instances" not in manifest_obj or not isinstance(manifest_obj["instances"], list):
+                manifest_obj["instances"] = []
+            manifest_obj["instances"].append(manifest_entry)
+            # atomic write via temp file replace
+            tmp_path = self.manifest_path.with_suffix(".tmp")
+            with open(tmp_path, "wt", encoding="utf-8") as tf:
+                json.dump(manifest_obj, tf, indent=2)
+                tf.flush()
+                try:
+                    os.fsync(tf.fileno())
+                except Exception:
+                    pass
+            os.replace(str(tmp_path), str(self.manifest_path))
+        except Exception:
+            # best-effort: if manifest update fails, continue but log warning
+            if self._logger:
+                self._logger.log("instance_manifest_update_failed", {"instance_id": inst_id, "path": str(saved_path)})
+            else:
+                print(f"[warn] failed to update manifest for instance {inst_id}")
+
+        # log creation
+        if self._logger:
+            self._logger.log("instance_generated", {"instance_id": inst_id, "path": str(saved_path), "seed": per_instance_seed})
+        else:
+            print(f"[info] Generated instance {inst_id} -> {saved_path} (seed={per_instance_seed})")
+
+        return instance
+
+    def generate_all(self) -> List[Instance]:
+        """
+        Generate the full collection of instances according to the configured
+        n_values, theta_values, instance_types and replicates_per_setting.
+
+        Returns:
+            list of generated Instance objects (length equals instance_types * len(n_values) * len(theta_values) * replicates)
+        """
+        instances: List[Instance] = []
+        # iterate types 1..instance_types (paper uses 3)
+        # to match paper explicitly use types 1,2,3
+        types_to_iterate = [1, 2, 3] if int(self.instance_types) >= 3 else list(range(1, int(self.instance_types) + 1))
+        total_expected = len(types_to_iterate) * len(self.n_values) * len(self.theta_values) * int(self.replicates_per_setting)
+        if self._logger:
+            self._logger.log("generate_all_started", {"total_expected": total_expected})
+        else:
+            print(f"[info] Starting generation of {total_expected} instances...")
+
+        for t in types_to_iterate:
+            for n in self.n_values:
+                for theta in self.theta_values:
+                    for rep in range(int(self.replicates_per_setting)):
+                        try:
+                            inst = self.generate_one(type_index=t, n=int(n), theta=float(theta), replicate=int(rep))
+                            instances.append(inst)
+                        except Exception as ex:
+                            # log and continue with other instances
+                            msg = f"Failed to generate instance type={t}, n={n}, theta={theta}, rep={rep}: {ex}"
+                            if self._logger:
+                                self._logger.log("generate_one_failed", {"type": t, "n": n, "theta": theta, "rep": rep, "error": str(ex)}, level="ERROR")
+                            else:
+                                print("[error] " + msg)
+                            # continue to next instance
+                            continue
+
+        if self._logger:
+            self._logger.log("generate_all_completed", {"generated": len(instances)})
+        else:
+            print(f"[info] Generation completed: {len(instances)} instances generated.")
+
+        return instances
+
+
+# If run as script, do a small demo generation of a single instance subset
+if __name__ == "__main__":  # pragma: no cover - demonstration
+    # Use default config; create generator and produce a tiny set with reduced replicates
+    demo_cfg = {
+        "instance_generation": {
+            "n_values": [10],
+            "theta_values": [0.3],
+            "instance_types": 3,
+            "replicates_per_setting": 1,
+            "coord_grid": {"start": 0.0, "end": 15.0, "step": 0.5},
+            "cluster_generation": {"gamma_distribution": {"mu": 0.0, "sigma": 10.0}},
+            "demand_sampling": {"values": [10, 20, 30, 40, 50]},
+            "time_window_generation": {
+                "half_width_distribution": {"mu": 30.0, "sigma": 10.0},
+                "solomon_center_method": True,
+            },
+            "seeds": {"base_seed": 123456},
+        },
+        "output": {"instances_dir": "instances_demo"},
+        "problem_parameters": {"L_t": 480},
+    }
+    gen = InstanceGenerator(config=demo_cfg)
+    gen.generate_all()
+```
